@@ -1,0 +1,534 @@
+/* An example to apply data clean logic to detect various data defection
+ * such as the value exceeds range limit, value trend has a prompt drop and exceed the smoothing filter threshold,
+ * timestamp is out of order or breaks the 5-min interval rule, has duplicate packet etc.
+*/
+
+namespace com.ibm.mdt.clean.connect;
+
+use com.ibm.mdt.spltypes::*;
+use com.ibm.mdt.utils::*;
+
+		
+composite CleanConnectData(input s1; output s1Clean, s1Flagged){
+
+graph
+	
+	//Create all the flags that need to be set
+	
+	stream<GenericDataSchemaWithFlags> s1WithFlags = Functor(s1){
+		logic state: {
+		map<FLAGFIELDNAMES,boolean> fv = {ARTIFACT1: false, ARTIFACT2: false, OVERLAP1: false, OVERLAP2: false, OUTOFRANGE: false, INACCURATE: false}; 
+		mutable map<int32, int64> sN = {};
+		}
+		onTuple s1: {
+			if(has(sN,PERSON_ID)){
+				insertM(sN,PERSON_ID, (int64)0);
+			}
+			else{
+				sN[PERSON_ID]++;
+			}
+		}
+	
+		output 
+			s1WithFlags: flagValues = fv, sequenceNumber = sN[PERSON_ID]; 
+	}
+	
+	
+	
+	/* do a check-in test here  */
+	/*
+	stream<DataSchemaWithFlags> s1WithFlags = Functor(s1){
+		output s1WithFlags: ARTIFACT1 = false, ARTIFACT2= false, 
+							OVERLAP1 = false, OVERLAP2=false, OUTOFRANGE = false,
+							INACCURATE = false;
+	}
+     
+	() as ScreenWriter = Custom(s1WithFlags) {
+			logic 
+				onTuple s1WithFlags: 
+					printStringLn("The tuple = " + (rstring)s1WithFlags);
+		} 
+     */
+	
+	//Rule order 5->1->2->4->3
+	
+	//Apply Rule 5 - to mark overlap flag 1 in SG	
+	stream<s1WithFlags> s1Overlap1 = Custom(s1WithFlags){
+		logic state:{
+			mutable map<int32,timestamp> maxTs;
+		}
+		onTuple s1WithFlags:{
+			//if(ft==SG){
+				if(has(maxTs,PERSON_ID)){
+					if(PUMP_TIME_TS <= maxTs[PERSON_ID]){
+						//Set overlap1 flag
+						mutable tuple<s1WithFlags>tmp = s1WithFlags;
+						tmp.flagValues[OVERLAP1] = true;
+						//printStringLn("epoch = "+(rstring)PUMP_TIME_TS+" is earlier than the current");
+						//printStringLn("max1="+(rstring)maxTs[PERSON_ID]);
+						submit(tmp,s1Overlap1);
+					}
+					else{
+						maxTs[PERSON_ID]=PUMP_TIME_TS;
+						//printStringLn("epoch= "+(rstring)PUMP_TIME_TS+" is in order");
+						//printStringLn("max2="+(rstring)maxTs[PERSON_ID]);
+						submit(s1WithFlags,s1Overlap1);
+					}
+				}
+				else{
+					insertM(maxTs,PERSON_ID,PUMP_TIME_TS);
+					//printStringLn("person ID is inserted");
+					//printStringLn("max="+(rstring)maxTs[PERSON_ID]);
+					submit(s1WithFlags,s1Overlap1);
+				}
+			//}
+			//else{
+			//	submit(s1WithFlags,s1Overlap1);
+			//}
+		}
+	}
+	
+	
+	//Remove the Overlap 1 data - as it will mess up all windows downstream
+	(stream <GenericDataSchemaWithFlags> s1Overlap1Flagged;
+	stream <GenericDataSchemaWithFlags> s1Overlap1Clean) = Filter(s1Overlap1){
+		param filter: flagValues[OVERLAP1];
+	}
+	
+	//Apply cleaning rule 1 - check if SG value is out of range then turn on the outOfRange flag
+	stream<GenericDataSchemaWithFlags> s1Range = Custom(s1Overlap1Clean){
+		logic state: { 
+			int32 NULLVAL = getNullIntValue(); 
+		}
+		onTuple s1Overlap1Clean: {
+			if(ft==SG){
+				mutable int32 SG = intValues[SG_mgdL];
+				if(SG != NULLVAL){
+					if(SG < (int32)40 || SG > (int32)400){
+						//Set outOfRange flag
+						mutable tuple<GenericDataSchemaWithFlags>tmp = s1Overlap1Clean;
+						tmp.flagValues[OUTOFRANGE] = true;
+						
+						//printStringLn("SG = "+(rstring)SG+" is out of range");
+						submit(tmp,s1Range);
+					}
+					else{
+						//printStringLn("SG = "+(rstring)SG+" is in the range");
+						submit(s1Overlap1Clean,s1Range);
+					}
+				}
+				else{
+					//printStringLn("SG = "+(rstring)SG+" is NULL");
+					submit(s1Overlap1Clean,s1Range);
+				}
+			}
+			else{
+				submit(s1Overlap1Clean,s1Range);
+			}
+		}
+	}
+
+ 	//Apply cleaning rule 2 - check if active insulin value is out of range (<0 or >50) then turn on the outOfRange flag
+	stream<s1WithFlags> s3Range = Custom(s1Range){
+		logic state: { 
+			float64 NULLVAL = getNullFloatValue(); 
+		}
+		onTuple s1Range: {
+			if(ft==ACTIVEINSULIN){
+				mutable float64 ACTIVE_INSULIN_UNITS = floatValues[active_insulin_U];
+				if(ACTIVE_INSULIN_UNITS != NULLVAL){
+					if(ACTIVE_INSULIN_UNITS< (float64)0 || ACTIVE_INSULIN_UNITS> (float64)50){
+						//Set outOfRange flag
+						mutable tuple<s1Range>tmp = s1Range;
+						tmp.flagValues[OUTOFRANGE] = true;
+						//printStringLn("AI = "+(rstring)ACTIVE_INSULIN_UNITS+" is out of range");
+						submit(tmp,s3Range);
+					}
+					else{
+						//printStringLn("AI = "+(rstring)ACTIVE_INSULIN_UNITS+" is in the range");
+						submit(s1Range,s3Range);
+					}
+				}
+				else{
+					//printStringLn("AI = "+(rstring)ACTIVE_INSULIN_UNITS+" is NULL");
+					submit(s1Range,s3Range);
+				}
+			}
+			else{
+				submit(s1Range,s3Range);
+			}
+		}
+	}	
+	
+
+	
+	//Apply Rule 4 - to mark artifact flag 2 in SG	
+	stream<s1WithFlags> s1Art2 = Custom(s3Range){
+		logic state: { mutable map<int32, int32> lastSG = {};
+		 			   mutable map<int32, int32> SGgood = {};
+		 			   mutable map<int32, timestamp> SGgoodTS = {};
+		 			   mutable map<int32, boolean> artifact = {};
+		 			   mutable map<int32, int32> count = {};
+					   int32 NULLVAL = getNullIntValue();
+		}
+		onTuple s3Range:{
+			if(ft==SG){
+				mutable int32 SG = intValues[SG_mgdL];
+				if( has(lastSG,PERSON_ID) ){
+					
+					//printStringLn("lastSG = "+(rstring)lastSG[PERSON_ID]);
+					//printStringLn("SGgood = "+(rstring)SGgood[PERSON_ID]+" SGgoodTS="+(rstring)SGgoodTS[PERSON_ID]);
+					
+					if(artifact[PERSON_ID]){
+						//We are in an artifact period
+						//Need to add logic to account for unclean current or prior data
+						if(count[PERSON_ID]>(int32)12 || (diffAsSecs(PUMP_TIME_TS,SGgoodTS[PERSON_ID]) > (float64)(12*300))){
+							//End the artifact period
+							artifact[PERSON_ID] = false;
+							count[PERSON_ID] = (int32)0;
+							SGgood[PERSON_ID] = SG;
+							//printStringLn("end artifact due to >12 pkg or >60min");
+							submit(s3Range,s1Art2);
+						}
+						else if(!flagValues[OUTOFRANGE] && !flagValues[OVERLAP1] && !flagValues[OVERLAP2]){
+							if((float32)SG >= (float32)0.85*(float32)SGgood[PERSON_ID]){
+								//End the artifact period
+								artifact[PERSON_ID] = false;
+								count[PERSON_ID] = (int32)0;
+								SGgood[PERSON_ID] = SG;
+								//printStringLn("end artifact due to 85% threshold");
+								submit(s3Range,s1Art2);
+							}
+							else{
+								//stay with the artifact period
+								count[PERSON_ID] = count[PERSON_ID] + 1;
+								mutable tuple<s1WithFlags> tmp = s3Range;
+								tmp.flagValues[ARTIFACT2] = true;
+								//printStringLn("normal SG, still stay in artifact");
+								submit(tmp,s1Art2);
+							}
+						}
+						else{
+							//stay with the artifact period
+							if(flagValues[OUTOFRANGE]){
+								count[PERSON_ID] = count[PERSON_ID] + 1;
+							}
+							mutable tuple<s1WithFlags> tmp = s3Range;
+							tmp.flagValues[ARTIFACT2] = true;
+							//printStringLn("abnormal SG, still stay in artifact");
+							submit(tmp,s1Art2);
+						}
+					}
+					else{
+						//We are not in an artifact period
+						if(!flagValues[OUTOFRANGE] && !flagValues[OVERLAP1] && !flagValues[OVERLAP2] ){
+						
+							float32 diff = (float32)(SG-SGgood[PERSON_ID]);
+							if( (diff/(float32)SG*(float32)100 < (float32)-40) || diff < (float32)-65){
+								//Start artifact period
+								artifact[PERSON_ID] = true;
+								count[PERSON_ID] = (int32)1;
+								mutable tuple<s1WithFlags> tmp = s3Range;
+								tmp.flagValues[ARTIFACT2] = true;
+								//update the SGgood as the lastSG
+								SGgood[PERSON_ID] = lastSG[PERSON_ID];
+								SGgoodTS[PERSON_ID] = PUMP_TIME_TS;
+								//printStringLn("normal SG, meet threshold and start artifact");
+								submit(tmp,s1Art2);
+							}
+							else{
+								//update SGgood TS as the current
+								//no need to update SGgoodTS, because it is only used after starting the artifact
+								SGgood[PERSON_ID] = SG;
+								//printStringLn("normal SG, pass");
+								submit(s3Range,s1Art2);
+							}
+							
+						}
+						else{
+						//if SG is marked as out of range or overlap thus do not compute difference, do not update SGgood, do not mark artifact, let it pass
+							//printStringLn("abnormal SG, let it pass");
+							submit(s3Range, s1Art2);						
+						}
+					}
+					lastSG[PERSON_ID] = SG;
+				}
+				else{
+					if(!flagValues[OUTOFRANGE] && !flagValues[OVERLAP1] && !flagValues[OVERLAP2]){
+						insertM(lastSG,PERSON_ID, SG);
+						insertM(SGgood, PERSON_ID, SG);
+						insertM(SGgoodTS, PERSON_ID, PUMP_TIME_TS);
+						insertM(artifact, PERSON_ID, false);
+						insertM(count, PERSON_ID, (int32)0);
+					}
+					submit(s3Range, s1Art2);
+				}
+				
+			}
+			else{
+				submit(s3Range, s1Art2);
+			}
+		}
+	}
+	
+
+
+ 
+	//Apply Rule 3 - to mark artifact flag 1 in SG	//Apply Rule 3 - to mark artifact flag 1 in SG	
+	/*Consider the following release schedule
+
+	070 075 080 085 090 095 100 101 102 107 112 117 122 127 132 137
+
+	Window 1 [070 - 100], Ntuples 7 - send out 4th value, i.e. 085
+	Window 2 [075 - 102], Ntuples 8 - send out 4th value, i.e. 090
+	Window 3 [080 - 107], Ntuples 8 - send out 4th value, i.e. 095
+	Window 4 [085 - 112], Ntuples 8 - send out 4th value, i.e. 100
+	Window 5 [090 - 117], Ntuples 8 - send out 4th value, i.e. 101
+
+	070 075 080 085 090 095 100 101 102 107 112 113 114 115 120 125 130 135 140
+
+	Window 1 [070 - 100], Ntuples 7 - send out 4th value, i.e. 085
+	Window 2 [075 - 102], Ntuples 8 - send out 4th value, i.e. 090
+	Window 3 [080 - 107], Ntuples 8 - send out 4th value, i.e. 095
+	Window 4 [085 - 115], Ntuples 11 - send out 4th value, i.e. 100
+	Window 5 [090 - 120], Ntuples 11 - send out 4th value, i.e. 101
+	Window 6 [095 - 122], Ntuples 8 - send out the 4th value, i.e. 102
+	
+	If we always release the 4th value, we will release all tuples one by one
+	Since we always slide by 1 from the front. We then need to change the function
+	isArtifact to only include those values whose timestamps are apart from the current
+	timestamp by integer multiples of 300
+	
+	 * 
+	 */
+     stream<s1WithFlags> s1Art1 = Custom(s1Art2){
+		logic state: { mutable map<int32,list<tuple<s1WithFlags>> > collection = {}; 
+					   mutable map<int32,list<tuple<s1WithFlags>> > non_SG = {}; 
+					   mutable map<int32, timestamp> gap_start = {};
+					   mutable map<int32, timestamp> gap_end = {};
+					   mutable map<int32, boolean> in_gap = {};
+					   int32 NULLVAL = getNullIntValue();}
+		onTuple s1Art2:{
+			//printStringLn("input = " + (rstring)s1Art2);
+			if(ft==SG){
+				if( has(collection,PERSON_ID) ){
+					mutable int32 N = size(collection[PERSON_ID]);
+					//printStringLn("collection size="+(rstring)N);
+					
+					
+					//Append to the list in the map or trigger compute
+					//check if the current SG came in within 5 min 
+					mutable float64 interval_time = (float64)diffAsSecs(PUMP_TIME_TS,collection[PERSON_ID][N-1].PUMP_TIME_TS);
+					
+					if(interval_time<(float64)0){
+						//a packet came with earlier timestamp, keep it in a non-SG collection
+						//printStringLn("put non-SG buffer");
+						appendM(non_SG[PERSON_ID],s1Art2);
+					}
+					
+					
+					else if(interval_time <= (float64)300){
+						//printStringLn("SG came in within 5 min");
+						//printStringLn("current epoch="+(rstring)PUMP_TIME_TS+" N epoch="+(rstring)collection[PERSON_ID][N-1].PUMP_TIME_TS+" index0 epoch="+(rstring)collection[PERSON_ID][0].PUMP_TIME_TS);
+						
+						if(diffAsSecs(PUMP_TIME_TS,collection[PERSON_ID][0].PUMP_TIME_TS) > (float64)(30*60)){
+							//printStringLn("call isArtifact");
+							//Trigger the compute of the flag for the middle value
+							mutable boolean artifact = isArtifact(collection[PERSON_ID],NULLVAL);
+							//Submit the tuple
+							collection[PERSON_ID][3].flagValues[ARTIFACT1] = artifact;
+							//collection[PERSON_ID][3].ARTIFACT1 = artifact;
+							
+							
+							//check timestamp to release non-SG if it is eligible
+							if(size(non_SG[PERSON_ID])>(int32)0){
+								mutable int32 numb = (int32)0;
+								for(tuple<s1WithFlags> x in (non_SG[PERSON_ID])) {
+									if(x.PUMP_TIME_TS < collection[PERSON_ID][3].PUMP_TIME_TS){
+										submit(x,s1Art1);
+										numb++;
+									}
+								}
+								if(numb>(int32)0){
+									removeM(non_SG[PERSON_ID],0,numb-1);
+								}
+							}
+									
+							//submit the 4th SG
+							//check if the gap has ended
+							if(in_gap[PERSON_ID]){
+								//Always submit the 4th value, i.e. index 3
+								if( diffAsSecs(gap_start[PERSON_ID], collection[PERSON_ID][3].PUMP_TIME_TS) > (float64)0 ||
+								    diffAsSecs(collection[PERSON_ID][3].PUMP_TIME_TS, gap_end[PERSON_ID])> (float64)0 ){
+									in_gap[PERSON_ID]=false;
+									//printStringLn("gap ends");
+								}
+							}
+						
+							if(!in_gap[PERSON_ID]){
+								submit(collection[PERSON_ID][3],s1Art1);
+								//printStringLn("not in gap and submit the 4th");
+							}
+
+							//Update the array
+							removeM(collection[PERSON_ID],0);
+							appendM(collection[PERSON_ID],s1Art2);
+							
+							
+						}
+						else{
+							//List is not yet full - add it to the list
+							appendM(collection[PERSON_ID], s1Art2);
+						}
+						
+					}
+					else{
+						//if the current SG came in longer than 5 min, assign the start and end points of the gap
+						in_gap[PERSON_ID]= true;
+						//printStringLn("gap starts");
+						//printStringLn("current epoch="+(rstring)PUMP_TIME_TS+" N epoch="+(rstring)collection[PERSON_ID][N-1].PUMP_TIME_TS+" index0 epoch="+(rstring)collection[PERSON_ID][0].PUMP_TIME_TS);
+						
+						gap_start[PERSON_ID]=add(collection[PERSON_ID][N-1].PUMP_TIME_TS,(float64)300);
+						//printStringLn("gap start="+(rstring)gap_start[PERSON_ID]);
+						gap_end[PERSON_ID]= gap_start[PERSON_ID];
+						//Insert NULLs until 30 min from the start, and then NULLS after that
+						//mutable int32 totalNullsToInsert = (int32)(diffAsSecs(PUMP_TIME_TS,collection[PERSON_ID][N-1].PUMP_TIME_TS)/(float64)300) - 1;
+						mutable int32 totalNullsToInsert = (int32)(diffAsSecs(PUMP_TIME_TS,collection[PERSON_ID][N-1].PUMP_TIME_TS)/(float64)300);
+						//printStringLn("total NA need to insert="+(rstring)totalNullsToInsert);
+						mutable int32 counter = (int32)0;
+						timestamp lastPumpTime = collection[PERSON_ID][N-1].PUMP_TIME_TS;
+						//printStringLn("gap start="+(rstring)gap_start[PERSON_ID]+" gap end="+(rstring)gap_end[PERSON_ID]);
+						
+						while(counter<totalNullsToInsert){
+						
+							counter++;
+							mutable tuple<s1WithFlags> tmp = {};
+							tmp.intValues[SG_mgdL] = NULLVAL;
+							tmp.PUMP_TIME_TS = add(lastPumpTime,(float64)(counter*300));
+							gap_end[PERSON_ID] = tmp.PUMP_TIME_TS;
+							if( diffAsSecs(tmp.PUMP_TIME_TS,collection[PERSON_ID][0].PUMP_TIME_TS) > (float64)(30*60) ){
+								//printStringLn("during gap, call isArtifact");
+								//Trigger the compute of the middle value
+								mutable boolean artifact = isArtifact(collection[PERSON_ID], NULLVAL);
+								collection[PERSON_ID][3].flagValues[ARTIFACT1] = artifact;
+								//collection[PERSON_ID][3].ARTIFACT1 = artifact;
+								
+								//check timestamp to release non-SG if it is eligible
+								if(size(non_SG[PERSON_ID])>(int32)0){
+									mutable int32 numb = (int32)0;
+									for(tuple<s1WithFlags> x in (non_SG[PERSON_ID])) {
+										if(x.PUMP_TIME_TS < collection[PERSON_ID][3].PUMP_TIME_TS){
+											submit(x,s1Art1);
+											numb++;
+										}
+									}
+									if(numb>(int32)0){
+										removeM(non_SG[PERSON_ID],0,numb-1);
+									}
+								}
+								
+						
+								//Submit the middle value
+								if( diffAsSecs(gap_start[PERSON_ID], collection[PERSON_ID][3].PUMP_TIME_TS) > (float64)0 ) {
+									submit(collection[PERSON_ID][3],s1Art1);
+									//printStringLn("timestamp of SG submitted="+(rstring)collection[PERSON_ID][3].PUMP_TIME_TS);
+									//printStringLn("during gap submit the 4th");
+									
+								}
+								
+								//Update the array
+								removeM(collection[PERSON_ID],0);
+								appendM(collection[PERSON_ID],tmp);
+								
+								
+							}
+							else{
+								//Update the array
+								appendM(collection[PERSON_ID],tmp);
+							}
+						}
+						
+						//end the gap after inserting NULLs
+						//printStringLn("gap end="+(rstring)gap_end[PERSON_ID]);
+						
+						//append the current SG to collection after inserting NULLs
+						if(diffAsSecs(PUMP_TIME_TS,collection[PERSON_ID][0].PUMP_TIME_TS) > (float64)(30*60) ){
+						
+							mutable boolean artifact = isArtifact(collection[PERSON_ID], NULLVAL);
+							collection[PERSON_ID][3].flagValues[ARTIFACT1] = artifact;
+							//collection[PERSON_ID][3].ARTIFACT1 = artifact;
+								
+							if(size(non_SG[PERSON_ID])>(int32)0){
+								mutable int32 numb = (int32)0;
+								for(tuple<s1WithFlags> x in (non_SG[PERSON_ID])) {
+									if(x.PUMP_TIME_TS < collection[PERSON_ID][3].PUMP_TIME_TS){
+										submit(x,s1Art1);
+										numb++;
+									}
+								}
+								if(numb>(int32)0){
+									removeM(non_SG[PERSON_ID],0,numb-1);
+								}
+							}
+								
+						
+							//Submit the middle value
+							if( diffAsSecs(gap_start[PERSON_ID], collection[PERSON_ID][3].PUMP_TIME_TS) > (float64)0 ) {
+								submit(collection[PERSON_ID][3],s1Art1);
+							}
+							removeM(collection[PERSON_ID],0);
+							appendM(collection[PERSON_ID],s1Art2);
+						}
+						else{
+							appendM(collection[PERSON_ID],s1Art2);
+						}
+						
+					
+					}
+					
+				}
+				else{
+					//Add to the map
+					mutable list<s1WithFlags> tmpList = [];
+					insertM(non_SG, PERSON_ID, tmpList);
+					//Add the 3 fake SGs in order to submit the very first SGs
+					mutable tuple<s1WithFlags> tmp = {};
+					tmp.intValues[SG_mgdL] = NULLVAL;
+					tmp.PUMP_TIME_TS = add(PUMP_TIME_TS, (float64)(-300*3));
+					appendM(tmpList,tmp);
+					tmp.PUMP_TIME_TS = add(PUMP_TIME_TS, (float64)(-300*2));
+					appendM(tmpList,tmp);
+					tmp.PUMP_TIME_TS = add(PUMP_TIME_TS, (float64)(-300*1));
+					appendM(tmpList,tmp);						
+					appendM(tmpList,s1Art2);
+					insertM(collection, PERSON_ID, tmpList);
+					
+					//initialize the gap window
+					insertM(gap_start, PERSON_ID, PUMP_TIME_TS);
+					insertM(gap_end, PERSON_ID, PUMP_TIME_TS);
+					insertM(in_gap, PERSON_ID, false);
+				}
+			}
+			else{
+				//if other type of packet, the push to the non SG packet collection
+				if( has(collection,PERSON_ID) ){
+					appendM(non_SG[PERSON_ID],s1Art2);
+				}
+				else{
+					mutable list<s1WithFlags> tmpList = [];
+					insertM(non_SG, PERSON_ID, tmpList);
+				}
+				
+			}
+		}
+		
+	}
+ 
+	(stream<GenericDataSchemaWithFlags> s1Flagged;
+	stream<GenericDataSchemaWithFlags> s1Clean) = Filter(s1Art1,s1Overlap1Flagged){
+		param filter: flagValues[ARTIFACT1] || flagValues[ARTIFACT2] || flagValues[OVERLAP1] ||
+					  flagValues[OVERLAP2] || flagValues[INACCURATE] || flagValues[OUTOFRANGE];
+	}	
+	
+	
+}

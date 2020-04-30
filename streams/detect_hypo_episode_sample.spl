@@ -1,0 +1,284 @@
+/* An example to detect hypo episode in SG streams and append episode marker as extra attributes to pass down as output */
+
+namespace com.ibm.mdt.insights.mydata ;
+
+use com.ibm.mdt.spltypes::*;
+use com.ibm.mdt.utils::*;
+
+public composite add_hypo(input bulk_stream; output HypoEP){
+
+	//param
+		//expression<rstring> $dpsconfig;
+		
+	graph
+	
+	//test hypo episode
+	stream<GenericDataSchemaWithFlags> HypoEP = Custom(bulk_stream) {
+		logic state: {
+			
+			mutable map<int32,list<tuple<GenericDataSchemaWithFlags> > > collection = {};
+				
+			  //required packets counts to start and end hypo episode
+			  mutable map<int32, int32> hypo_in = {};
+			  mutable map<int32, int32> hypo_out = {};
+			  
+			  //timestamp for the last SG and episode timestamp
+			  mutable map<int32, timestamp> last_SG = {};
+			  mutable map<int32, timestamp> hypo_start_ts = {};
+			  mutable map<int32, timestamp> hypo_end_ts = {};
+			  //mutable uint64 _storeHandle = getDPSThresholdStoreHandle($dpsconfig);
+		}
+		onTuple bulk_stream:{
+		
+			if(!has(last_SG, PERSON_ID)){ //initial map
+			
+				if(ft!=SG){
+					//release the packet
+					submit(bulk_stream, HypoEP);
+					return;
+				}
+				else{	//if it is the SG packet
+			
+					mutable list <GenericDataSchemaWithFlags> tmpList = [];
+					//appendM(tmpList,bulk_stream);
+					insertM(collection,PERSON_ID,tmpList);
+					
+					insertM(last_SG, PERSON_ID, PUMP_TIME_TS);
+					
+					insertM(hypo_start_ts, PERSON_ID, PUMP_TIME_TS);
+					insertM(hypo_end_ts, PERSON_ID, PUMP_TIME_TS);
+					insertM(hypo_in, PERSON_ID, 0);
+					insertM(hypo_out, PERSON_ID, 0);
+				}
+			
+			}
+			
+			
+			if(has(last_SG, PERSON_ID)){
+			
+				if(ft!=SG){
+				
+					//check if this is a RESET packet in stream
+					if(ft==RESET){
+						//release the pending buffer if there is
+						if(size(collection[PERSON_ID])>0){
+							for(tuple<GenericDataSchemaWithFlags> x in (collection[PERSON_ID])){
+								if(x.ft != HYPOHYPER){
+										submit(x,HypoEP);
+								}
+							}
+						}
+						//clear the buffer
+						clearM(collection[PERSON_ID]);
+						hypo_in[PERSON_ID]==0;
+						hypo_out[PERSON_ID]==0;
+						
+						//release the RESET packet
+						submit(bulk_stream, HypoEP);
+						
+					}
+					else{ //if the packet is a type rather than RESET
+				
+						if(hypo_in[PERSON_ID]==0){
+							submit(bulk_stream, HypoEP);
+						} 
+						else{
+							appendM(collection[PERSON_ID], bulk_stream);
+						}
+					}
+				}
+				else if(ft==SG){
+				
+					//#############################################
+					//logic to detect Hypo
+					//int32 hypothreshold = getHypoThreshold(PERSON_ID,_storeHandle);
+					int32 hypothreshold = 70;
+					if(hypo_in[PERSON_ID]==0 && intValues[SG_mgdL]>=hypothreshold ){
+						//no buffering
+						submit(bulk_stream, HypoEP);
+						//printStringLn("sg ="+ (rstring)bulk_stream.PUMP_TIME + " mgdL=" + (rstring)bulk_stream.intValues[SG_mgdL]);
+					}
+					else if(hypo_in[PERSON_ID]==0 && intValues[SG_mgdL]<hypothreshold ){
+						hypo_in[PERSON_ID]=1; //start the process
+						hypo_start_ts[PERSON_ID]=PUMP_TIME_TS; 
+						//printStringLn("hypo start="+ (rstring)bulk_stream.PUMP_TIME + " mgdL=" + (rstring)bulk_stream.intValues[SG_mgdL]);
+						
+						mutable GenericDataSchemaWithFlags tmp= {};
+						tmp.PERSON_ID = PERSON_ID;
+						tmp.ft = HYPOHYPER;
+						tmp.PUMP_TIME_TS = hypo_start_ts[PERSON_ID]; //start timestamp
+						tmp.PUMP_TIME = (rstring)getTimeStampString(hypo_start_ts[PERSON_ID]); //start time string
+						tmp.intValues[SG_mgdL] = (int32)777;
+						tmp.flagValues[HYPOEPISODE]=true;
+						tmp.flagValues[HYPEREPISODE]=false;
+						tmp.flagValues[SEVEREHYPO]=false;
+						tmp.flagValues[SEVEREHYPER]=false;
+						
+						//put it in collection wait for submission till the episode ends
+						appendM(collection[PERSON_ID], bulk_stream);
+						appendM(collection[PERSON_ID], tmp);
+						
+					}
+					else{ //start a potential episode
+						
+					
+						if(diffAsSecs(PUMP_TIME_TS, last_SG[PERSON_ID])==(float64)300){ //consecutive SG
+						
+							//append SG before the logic
+							appendM(collection[PERSON_ID], bulk_stream);
+						
+							if(intValues[SG_mgdL]<hypothreshold){ //a hypo SGH
+								if(hypo_in[PERSON_ID]>0 && hypo_in[PERSON_ID]<3) {
+									hypo_in[PERSON_ID]=hypo_in[PERSON_ID]+1;
+									if(hypo_in[PERSON_ID]==3){
+										//release the buffer?
+										
+										//printStringLn("Hypo Ep start=" + (rstring)getTimeStampString(tmp.PUMP_TIME_TS)+(rstring)tmp.intValues[SG_mgdL]);
+									}
+								}
+								else if(hypo_out[PERSON_ID]==1){ //if have already entered an episode ending process, then restart the ending process
+									hypo_out[PERSON_ID]=0;
+									//continue buffering
+								}
+							}
+							else{ //a non-hypo SG
+								if(hypo_in[PERSON_ID]>0 && hypo_in[PERSON_ID]<3) {
+									hypo_in[PERSON_ID]=0;
+									//restart the process and release the current buffer without sending the HYPOHYPER
+									for(tuple<GenericDataSchemaWithFlags> x in (collection[PERSON_ID])) {
+										if(x.ft != HYPOHYPER){
+											submit(x,HypoEP);
+											if(x.ft==SG){
+												//printStringLn("sub1 SG="+ (rstring)x.PUMP_TIME + " mgdL=" + (rstring)x.intValues[SG_mgdL]);
+											}
+										}
+									}
+									clearM(collection[PERSON_ID]);
+									
+								}
+								else if(hypo_in[PERSON_ID]==3){
+									hypo_out[PERSON_ID]=hypo_out[PERSON_ID]+1;
+									if(hypo_out[PERSON_ID]==1){
+										hypo_end_ts[PERSON_ID]=last_SG[PERSON_ID];
+									}
+									else if(hypo_out[PERSON_ID]==2) { //end_episode();
+										hypo_in[PERSON_ID]=0;
+										hypo_out[PERSON_ID]=0;
+										mutable GenericDataSchemaWithFlags tmp= {};
+										tmp.PERSON_ID = PERSON_ID;
+										tmp.ft = HYPOHYPER;
+										tmp.PUMP_TIME_TS = hypo_end_ts[PERSON_ID]; //end timestamp
+										tmp.PUMP_TIME = (rstring)getTimeStampString(hypo_end_ts[PERSON_ID]); //end time string
+										tmp.intValues[SG_mgdL] = (int32)888;
+										tmp.flagValues[HYPOEPISODE]=true;
+										tmp.flagValues[HYPEREPISODE]=false;
+										tmp.flagValues[SEVEREHYPO]=false;
+										tmp.flagValues[SEVEREHYPER]=false;
+										//appendM(collection[PERSON_ID], tmp);
+										mutable int32 csize = size(collection[PERSON_ID]);
+										if(collection[PERSON_ID][csize-2].ft==RESET){
+											insertM(collection[PERSON_ID], tmp, csize-(int32)3);
+										}
+										else{
+											insertM(collection[PERSON_ID], tmp, csize-(int32)2);
+										}
+										
+										
+										//release the collection
+										//printStringLn("start release");
+										for(tuple<GenericDataSchemaWithFlags> x in (collection[PERSON_ID])) {
+												submit(x,HypoEP);
+												if(x.ft==SG){
+													//printStringLn("collection="+ (rstring)x.PUMP_TIME + " mgdL=" + (rstring)x.intValues[SG_mgdL]);
+												}
+												else{
+													//printStringLn("other collection="+(rstring)getTimeStampString(x.PUMP_TIME_TS)+" type="+(rstring)x.ft);
+												}
+										}
+										clearM(collection[PERSON_ID]);
+										//printStringLn("Hypo Ep end="+ (rstring)getTimeStampString(hypo_end_ts[PERSON_ID])+(rstring)tmp.intValues[SG_mgdL]);
+										//printStringLn("end release");
+									}
+										
+								}
+							}
+						}
+						else if(diffAsSecs(PUMP_TIME_TS, last_SG[PERSON_ID])!=(float64)300){ //non-consecutive SG
+							
+							if(hypo_in[PERSON_ID]>0 && hypo_in[PERSON_ID]<3){
+								hypo_in[PERSON_ID]=0;
+								//restart the process and release the current buffer without sending the HYPOHYPER
+								for(tuple<GenericDataSchemaWithFlags> x in (collection[PERSON_ID])) {
+									if(x.ft != HYPOHYPER){
+										submit(x,HypoEP);
+										if(x.ft==SG){
+											//printStringLn("sub2 SG="+ (rstring)x.PUMP_TIME + " mgdL=" + (rstring)x.intValues[SG_mgdL]);
+										}
+									}
+								}
+								clearM(collection[PERSON_ID]);
+								
+							}
+							else if(hypo_in[PERSON_ID]==3){
+								//end episode
+								hypo_in[PERSON_ID]=0; 
+								hypo_out[PERSON_ID]=0;
+									
+								//release the collection without sending the HYPOHYPER
+								//printStringLn("start sub");
+								for(tuple<GenericDataSchemaWithFlags> x in (collection[PERSON_ID])) {
+									if(x.ft != HYPOHYPER){
+										submit(x,HypoEP);
+										if(x.ft==SG){
+											//printStringLn("sub SG="+ (rstring)x.PUMP_TIME + " mgdL=" + (rstring)x.intValues[SG_mgdL]);
+										}
+									}
+								}
+								clearM(collection[PERSON_ID]);
+								//printStringLn("end sub");
+								//printStringLn("Hypo Ep end due to missing, no HYPOHYPER sent out");
+							}
+							
+							//submit SG after the logic
+							submit(bulk_stream, HypoEP);
+							
+							if( intValues[SG_mgdL]<hypothreshold && hypo_in[PERSON_ID]==0){
+								hypo_in[PERSON_ID]=1; //start the process
+								hypo_start_ts[PERSON_ID]=PUMP_TIME_TS; 
+								//printStringLn("hypo start="+ (rstring)bulk_stream.PUMP_TIME + " mgdL=" + (rstring)bulk_stream.intValues[SG_mgdL]);
+									
+								mutable GenericDataSchemaWithFlags tmp= {};
+								tmp.PERSON_ID = PERSON_ID;
+								tmp.ft = HYPOHYPER;
+								tmp.PUMP_TIME_TS = hypo_start_ts[PERSON_ID]; //start timestamp
+								tmp.PUMP_TIME = (rstring)getTimeStampString(hypo_start_ts[PERSON_ID]); //start time string
+								tmp.intValues[SG_mgdL] = (int32)777;
+								tmp.flagValues[HYPOEPISODE]=true;
+								tmp.flagValues[HYPEREPISODE]=false;
+								tmp.flagValues[SEVEREHYPO]=false;
+								tmp.flagValues[SEVEREHYPER]=false;
+								
+								//put it in collection wait for submission till the episode ends
+								appendM(collection[PERSON_ID], tmp);
+									
+							}
+							
+						}
+						
+						if(hypo_out[PERSON_ID]==2){ //end episode and reset the flags
+							hypo_in[PERSON_ID]=0; 
+							hypo_out[PERSON_ID]=0;
+						}
+						//printStringLn("hypo in="+ (rstring)hypo_in[PERSON_ID]+" hypo out="+(rstring)hypo_out[PERSON_ID]);
+					
+					}
+					
+					//reset SG timestamp
+					last_SG[PERSON_ID] = PUMP_TIME_TS;
+				}
+			}
+				
+		}
+	}
+
+}	

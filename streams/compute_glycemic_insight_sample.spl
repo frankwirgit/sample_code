@@ -1,0 +1,115 @@
+/* An example to compute one of the pre-defined glycemic feature related to bolus and bolus wizard */
+
+namespace com.ibm.mdt.featureextraction.bulk;
+
+use com.ibm.mdt.spltypes::*;
+use com.ibm.mdt.utils::*;
+
+	
+/* G3 - check if the bolus has a BW
+logic - bolus and BW usually have the same timestamp
+and if not, BW usually came before bolus, therefore, only a past window (size=5min) is required to look for BW once a bolus is received
+if there are multiple boluses came in within the 5 min window - which usually a dual (normal and square type), then those two boluses will be merged into one,
+given the type as "dual", and the timestamp and other values are assigned based on the first bolus, not the 2nd bolus
+if there are multiple BW came in within the 5min window - which is usually caused by the user's frequent adjustment of the BW one shortly after the other,
+then the most recent BW (to the bolus coming in next) is paired with the bolus
+as far as there is a BW timestamp, even any of the BW features have zero delivery, it is still counted as a valid BW to pair with bolus
+define a tumbling window with 5min in the past for any valid and merged-after bolus (delivered_U>0) 
+look for the BW with the closest timestamp in the window
+*/
+
+
+public composite G3_G155_stream(input s1Calibrated; output G3output,G155output) {
+param
+	expression<int32> $WindowSize: 5; //5 min window
+graph
+	//apply filter and data type to the input tuple after cleaning
+	stream<GenericDataSchemaWithFlags> G3input = Functor(s1Calibrated) {
+		            param
+		                filter : has(floatValues,BW_carb_input_g) || (has(floatValues,bolus_delivered_U) && floatValues[bolus_delivered_U]>(float64)0);     
+	}
+		        
+	(stream <GenericFeatureSchema> G3output;stream <GenericFeatureSchema> G155output) = Custom(G3input) {
+		
+		logic state:{ mutable map<int32, timestamp> LastBWts = {};
+					  mutable map<int32, boolean> FoundBW = {};
+					  
+					  int32 NULLVAL = -1; 
+					  //list<float64> g155binlist = (list<float64>)[0, 5, 10, 20, 30, 40, 50, (int32)getINFValue()];}
+					  list<float64> g155binlist = getBinRangeList(G155,getThisToolkitDir()+"/etc/FeatureBins.txt"); }
+		onTuple G3input:{
+		
+		//G3input here is either a BW or Bolus
+			if(!has(FoundBW, PERSON_ID)){
+				//initial the flags
+				if(ft==BOLUS){
+					insertM(FoundBW,PERSON_ID,false);
+				}
+				else{
+					insertM(FoundBW,PERSON_ID,true);
+					insertM(LastBWts,PERSON_ID,PUMP_TIME_TS);
+					
+				}
+			}
+			
+			if(ft==BOLUS){
+	
+				//do the bolus merge - it has already been done before getting the input stream	
+
+
+				mutable GenericFeatureSchema tmp = initializeGenericFeatureSchema();
+				mutable GenericFeatureSchema g155tmp = initializeGenericFeatureSchema(); //this is for feature g155
+				tmp.featureName="G3";
+				tmp.featureID = G3;
+				tmp.eventName = BOLUSE;
+				tmp.FEATURE_TIME_TS = PUMP_TIME_TS;
+				tmp.floatValue = floatValues[bolus_delivered_U];
+				tmp.stringValue = stringValues[bolus_type];
+				tmp.featureBin  = 1; //set the bin as the default #1 bin
+				
+				//check if there is a BW found
+				if(FoundBW[PERSON_ID]){
+					//check if the last BW is within the window
+					if(diffAsSecs(PUMP_TIME_TS, LastBWts[PERSON_ID])<=(float64)($WindowSize*(int32)60) && 
+					   diffAsSecs(PUMP_TIME_TS, LastBWts[PERSON_ID])>=(float64)0) {
+						tmp.booleanValue = 1;
+						tmp.featureBin  = 2; //set the bin as the #2 bin
+						
+						g155tmp.featureBin=bin_assign(g155tmp.floatValue,g155binlist);
+					}
+					else{ //if last BW falls off the window
+						tmp.booleanValue = 0;
+						
+						g155tmp.floatValue=getNullFloatValue();
+						g155tmp.featureBin=-1;
+					}
+				
+				}
+				else{ 
+					//no last BW found, set as no match, note: this is based on the assumption that BW always came "BEFORE" its matching bolus	
+					tmp.booleanValue = getNullBooleanValue();
+					
+					g155tmp.floatValue=getNullFloatValue();
+					g155tmp.featureBin=-1;
+				}
+				
+				//submit the last bolus
+				printStringLn("G3 = "+(rstring)tmp.FEATURE_TIME_TS + " featureBin=" + (rstring)tmp.booleanValue);
+				submit(tmp, G3output);
+				submit(g155tmp,G155output);
+				
+			}
+			else if(ft==BW){
+				//since BW usually comes before its paired bolus
+				//so just keep overwrite the previous BW to update the BW info with the current BW received
+				FoundBW[PERSON_ID]=true;
+				LastBWts[PERSON_ID]=PUMP_TIME_TS;
+				printStringLn("BW = "+(rstring)PUMP_TIME_TS);
+			
+			}
+		
+			
+		} //end of on tuple
+		
+	} //end of the stream
+} //end of the composite

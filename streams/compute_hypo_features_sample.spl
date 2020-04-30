@@ -1,0 +1,1172 @@
+/* An example to compute hypo associated features in SG stream ranged within series of pre-defined moving windows */
+
+namespace com.ibm.mdt.hypo.feature ;
+
+use com.ibm.streamsx.datetime::*;
+use com.ibm.mdt.clean::* ;
+use com.ibm.mdt.spltypes::* ;
+use com.ibm.mdt.utils::* ;
+use com.ibm.mdt.mydata.r2::* ;
+
+
+/*
+ * Move those needed types and functions from other places to this version
+ */
+ 
+type SGFeatureSet = int32 sgcount, int32 sglatest, int64 Epoch,
+	float64 sgmean10min, float64 sgmean15min, float64 sgmean20min,
+	float64 sgmean30min, float64 sgmean2hr, float64 sgmean4hr, int32 sgmin30ago,
+	int32 sg2hrago, int32 sg4hrago, int32 sglatestminusthirty,
+	int32 sgthirtyminustwo, int32 sgtwominusfour, float64 sgstdev30min,
+	float64 sgstdev2hr, float64 sgstdev4hr, float64 thirtyminslope,
+	float64 twohourslope, float64 fourhourslope;
+
+
+type CollectContext = list<int64> epochvals, list<float64> sgvals ;
+
+type CollectRHD = list<int64> epochvals, list<float64> rhdvals;
+type RHDFeatureN = int32 sgcurrent, int64 EpochN, float64 rhd, float64 rhd1day;
+type labelN = int32 hypo, int32 label2hr, int32 label3hr, int32 label4hr;
+type labelT = int32 hypo, int32 HypoStatus, float64 leadtime, int32 label30min, int32 label1hr, int32 label2hr, int32 label3hr, int32 label4hr;
+type recentHypoN = int32 recentHypo1hr, int32 recentHypo2hr, int32 recentHypo6hr, 
+	int32 recentHypo1Day, int32 recentHypo3Day, int32 recentHypo7Day, int32 recentHypo14Day, int32 recentHypo30Day,
+	int32 recentHypo1to3Day, int32 recentHypo3to7Day, int32 recentHypo7to14Day, int32 recentHypo14to30Day;
+
+type featureVectorStrT=
+	rstring Epoch_s,
+	rstring hypo_s,
+	rstring label2hr_s,
+	rstring label3hr_s,
+	rstring label4hr_s,
+	rstring recentHypo1hr_s,
+	rstring recentHypo2hr_s,
+	rstring recentHypo6hr_s, 
+	rstring recentHypo1Day_s, 
+	rstring recentHypo3Day_s, 
+	rstring recentHypo7Day_s, 
+	rstring recentHypo14Day_s, 
+	rstring recentHypo30Day_s,
+	rstring recentHypo1to3Day_s, 
+	rstring recentHypo3to7Day_s, 
+	rstring recentHypo7to14Day_s, 
+	rstring recentHypo14to30Day_s,
+	rstring rhd_s, 
+	rstring rhd1day_s,
+	rstring dayofweek_s,
+	rstring hourofday_s, 
+	rstring PERSON_ID_s,
+	rstring sglatest_s,
+	rstring sgmean10min_s, 
+	rstring sgmean15min_s,
+	rstring sgmean20min_s, 
+	rstring sgmean30min_s, 
+	rstring sgmean2hr_s,
+	rstring sgmean4hr_s, 
+	rstring sgmin30ago_s, 
+	rstring sg2hrago_s, 
+	rstring sg4hrago_s,
+	rstring sglatestminusthirty_s, 
+	rstring sgthirtyminustwo_s, 
+	rstring sgtwominusfour_s,
+	rstring sgstdev30min_s, 
+	rstring sgstdev2hr_s, 
+	rstring sgstdev4hr_s,
+	rstring thirtyminslope_s, 
+	rstring twohourslope_s, 
+	rstring fourhourslope_s,
+	rstring HypoStatus_s,
+	rstring label30min_s,
+	rstring label1hr_s
+;
+
+
+public float64 SGslope(list<float64> x, list<float64> y)
+{
+	if (size(x) == 0) {
+		return getNullFloatValue();
+	}
+	mutable float64 xx = 0, xy = 0 ;
+	mutable float64 xa = avg(x) ;
+	mutable float64 ya = avg(y) ;
+	
+	mutable float64	stdx = stddev(x);
+	mutable float64	stdy = stddev(y);
+	for(int32 i in range(x))
+	{
+		float64 tmpx = (x [ i ] - xa )/stdx;
+		float64 tmpy = (y [ i ] - ya) /stdy ;
+		xx +=(float64)(tmpx * tmpx) ;
+		xy += ((float64)tmpx * tmpy) ;
+		
+	}
+
+	float64 slope = xx==(float64) 0? getNullFloatValue(): xy / xx;
+	
+	//printStringLn("slope = "+(rstring)slope);
+	return(slope) ;
+}
+
+
+
+rstring convertToNA(rstring instr)
+{
+	mutable rstring st = instr;
+	st = regexReplacePerl(st, "-999.000","NA", true);
+	st = regexReplacePerl(st, "-999.00","NA", true);
+	st = regexReplacePerl(st, "-999","NA", true);
+	st = regexReplacePerl(st, "-nan", "NA", true);
+	st = regexReplacePerl(st, ",","",true);
+	return st;	
+}
+
+//functions related to RHD1Day
+boolean initRHD1D(mutable CollectRHD r)
+{
+	clearM(r.epochvals);
+	clearM(r.rhdvals);
+	return false;
+}
+
+boolean processRHD1D(float64 rhd_val, int64 epoch_val, mutable CollectRHD r)
+{
+	
+	if(rhd_val>=(float64)0){  //the rhd ranges from 0 to 240, here is to drop -999 NA cases
+		appendM(r.epochvals, epoch_val);
+		appendM(r.rhdvals, rhd_val); //build collection of Rhd
+	}
+	return false;
+}
+
+
+
+float64 computeRHD1D(CollectRHD r)  //to compute average of rhd1day = avg(r.rhdvals);
+{
+	mutable float64 rhd1day = (float64)-999; //if all rhd in the window is NA
+	
+	if(size(r.rhdvals)>0){
+		//check the collection
+		mutable int32 rhd_count = 0;
+		mutable float64 rhd_sum = (float64) 0;
+		for(int32 i in range(r.rhdvals)){
+			if(r.epochvals[size(r.epochvals)-1]-r.epochvals[i]>(int64)(4*3600)){ //if earlier than 4 hr from the end of the 1 day window
+				rhd_sum = rhd_sum + r.rhdvals[i];
+				rhd_count++;
+			}
+			else{
+				break;
+			}
+		}
+		if(rhd_count>0){
+			rhd1day = rhd_sum/(float64)rhd_count;
+		}
+	
+		//if there is no rhd in the 20 hours window, then assign NA as it has been initialized
+	}
+	
+	return (rhd1day);
+}
+	
+
+
+public composite ComputeHypoFeaturesMargin(input readDir ; output
+	formattedOutput, sgArtifact1)
+{
+	param
+		expression<rstring> $outputDir ;
+	graph
+		stream<SGFileType> readFilename = FileSource(readDir)
+		{
+			param
+			//hasHeaderLine:1u;
+				parsing : permissive ;
+			output
+				readFilename : fname = FileName() ;
+		}
+
+		stream<GenericDataSchemaWithMID> sgstream = Custom(readFilename)
+		{
+			logic
+				state :
+				{
+					mutable GenericDataSchemaWithMID gds = { } ;
+				}
+
+				onTuple readFilename :
+				{
+					if(!(PUMP_TIME == "SG_dt"))
+					{
+						gds = makeGenericSchemaSG(readFilename,(int32) substring(fname,
+							findLastOf(fname, "/", length(fname) - 1) + 1, findLastOf(fname, "_",
+							length(fname) - 1) - findLastOf(fname, "/", length(fname) - 1) - 1)) ;
+						submit(gds, sgstream) ;
+					}
+
+				}
+
+		}
+
+		stream<GenericDataSchema> bulkStream = Functor(sgstream)
+		{
+		}
+
+		(stream<GenericDataSchemaWithFlags> s1Clean ;
+			stream<GenericDataSchemaWithFlags> s1Flagged ;
+			stream<GenericDataSchemaWithFlags> s1Mixed) =
+			CleanGuardianConnectData(bulkStream) 
+		{
+		}
+		
+		
+		stream<int32 PERSON_ID, rstring PUMP_TIME, int64 Epoch, rstring SG_mgdL> sgArtifact1 = Functor(s1Flagged)
+		{
+			param
+				filter: flagValues[ARTIFACT1] && !flagValues[ARTIFACT2] && !flagValues[OVERLAP1] &&
+					  !flagValues[OVERLAP2] && !flagValues[INACCURATE] && !flagValues[OUTOFRANGE];
+			output sgArtifact1:
+				Epoch =(int64) toTimeMillis(PUMP_TIME_TS)/(int64)1000,
+				SG_mgdL = convertToNA((rstring)intValues [ SG_mgdL ]);
+		}
+		
+		//count the number of the total artifact1 packet
+		/* onPunct sgArtifact1: if (currentPunct() == Sys.FinalMarker) */
+		
+		//keep the artifact1
+		stream<GenericDataSchemaWithFlags> s1CleanArt1 = Functor(s1Mixed)
+		{
+			param
+				filter: !flagValues[ARTIFACT2] && !flagValues[OVERLAP1] &&
+					  !flagValues[OVERLAP2] && !flagValues[INACCURATE] && !flagValues[OUTOFRANGE];
+		}
+		
+
+		//To add hypo episode - episode consumption: mark SG as hypo at the starting of the episode
+		stream<GenericDataSchemaWithFlags> episodeStream = add_hypo(s1CleanArt1)
+		{
+		}
+
+		stream<GenericDataSchemaWithFlags> sghypo_pre = Functor(episodeStream)
+		{
+			param
+				filter : ft == FIELDTYPE.SG ||(ft == FIELDTYPE.HYPOHYPER);
+		}
+		
+
+		//a custom composite to compute labels
+		stream<GenericDataSchemaWithFlags, labelT> sghypo = Custom(sghypo_pre)
+		{
+			logic
+				state :
+				{
+					mutable map<int32, list<tuple<GenericDataSchemaWithFlags>>> collectpk = { } ;
+					mutable tuple<GenericDataSchemaWithFlags, tuple<labelT>> tmp = { } ;
+					mutable map<int32, boolean> InEpisode={};
+				}
+
+				onTuple sghypo_pre :
+				{
+					if(! has(collectpk, PERSON_ID))
+					{
+						mutable list<GenericDataSchemaWithFlags> tmpk = [ ] ;
+						appendM(tmpk, sghypo_pre) ;
+						insertM(collectpk, PERSON_ID, tmpk) ;
+						InEpisode[PERSON_ID]=false;
+					}
+
+					else
+					{
+						if(ft == SG)
+						{
+							//release SG if it is inside the episode, note that all the labels are assigned to be 1
+							if(InEpisode[PERSON_ID]){
+								assignFrom(tmp, sghypo_pre) ;
+								tmp.hypo = 0 ;
+								tmp.HypoStatus = 1;
+								tmp.leadtime = (float64) 0;
+								tmp.label30min = 1;
+								tmp.label1hr = 1;
+								tmp.label2hr = 1 ;
+								tmp.label3hr = 1 ;
+								tmp.label4hr = 1 ;
+								submit(tmp, sghypo) ;
+							}
+							else{
+								/* 
+								//release any packets in collection with timestamp 4-hr earlier than current
+								if(size(collectpk [ PERSON_ID ]) > 0)
+								{
+									
+									mutable int32 numb = 0 ;
+									for(tuple<GenericDataSchemaWithFlags> x in collectpk [ PERSON_ID ])
+									{
+										//check the window size
+										if(diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS) >(float64)(4 * 3600))
+										{
+											assignFrom(tmp, x) ;
+											tmp.hypo = 0 ;
+											tmp.HypoStatus = 0;
+											tmp.label30min = 0;
+											tmp.label1hr = 0;
+											tmp.label2hr = 0 ;
+											tmp.label3hr = 0 ;
+											tmp.label4hr = 0 ;
+											submit(tmp, sghypo) ;
+											numb ++ ;
+										}
+
+										else
+										{
+											break ;
+										}
+
+									}
+									//remove released ones from the sg collection
+									if(numb >(int32) 0)
+									{
+										removeM(collectpk [ PERSON_ID ], 0, numb - 1) ;
+									}
+
+								}
+								*/
+								
+								//insert the current SG in collection
+								appendM(collectpk [ PERSON_ID ], sghypo_pre) ;
+							}
+						}
+
+						else if(ft == HYPOHYPER)
+						{
+							
+							//release all packets in collection by assigning the corresponding labels
+							if(size(collectpk [ PERSON_ID ]) > 0)  //when the received HYPOHYPER is the starting of episode
+							{
+								for(tuple<GenericDataSchemaWithFlags> x in collectpk [ PERSON_ID ])
+								{
+									assignFrom(tmp, x) ;
+									tmp.hypo = 0 ;
+									tmp.HypoStatus = 0;
+									tmp.label30min = 0;
+									tmp.label1hr = 0;
+									tmp.label2hr = 0 ;
+									tmp.label3hr = 0 ;
+									tmp.label4hr = 0 ;
+
+									//check the window size
+									//update the corresponding labels
+									tmp.leadtime = diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS);
+									if(tmp.leadtime >(float64)(4 * 3600))
+									{//keep labels as what they are initialized 
+									}
+									else if(tmp.leadtime >(float64)(3 * 3600))
+									{ //between 3-4hr ago
+										tmp.label4hr = 1 ;
+									}
+									else if(tmp.leadtime >(float64)(2 * 3600))
+									{ //between 2-4hr ago
+										tmp.label3hr = 1 ;
+										tmp.label4hr = 1 ;
+									}
+									else if(tmp.leadtime >(float64)(3600))
+									{ //between 1-4hr ago
+										tmp.label2hr = 1 ;
+										tmp.label3hr = 1 ;
+										tmp.label4hr = 1 ;
+									}
+									else if(tmp.leadtime >(float64)(1800))
+									{ //between 30min-4hr ago
+										tmp.label1hr = 1;
+										tmp.label2hr = 1 ;
+										tmp.label3hr = 1 ;
+										tmp.label4hr = 1 ;
+									}
+									else
+									{
+										tmp.label30min = 1;
+										tmp.label1hr = 1;
+										tmp.label2hr = 1 ;
+										tmp.label3hr = 1 ;
+										tmp.label4hr = 1 ;
+										//mark the last SG in collection as hypo since it is the beginning of the episode
+										if(tmp.leadtime ==(float64) 0 && intValues [SG_mgdL ] == 777)
+										{
+											tmp.hypo = 1 ;
+											tmp.HypoStatus = 1;
+										}
+
+									}
+									submit(tmp, sghypo) ;
+								}
+								//clear sg collection
+								clearM(collectpk [ PERSON_ID ]) ;
+
+							}
+							
+							//switch the In Episode flag
+							if(intValues [SG_mgdL ] == 777){
+									InEpisode[PERSON_ID]=true;
+							}
+							else if(intValues [SG_mgdL ] == 888){
+								InEpisode[PERSON_ID]=false;
+							}
+
+							//submit the current HYPOHYPER packet
+							assignFrom(tmp, sghypo_pre) ;
+							tmp.hypo = 0 ;
+							tmp.HypoStatus = InEpisode[PERSON_ID]==true? 1 : 0;
+							tmp.leadtime = (float64) 0;
+							tmp.label30min = 0;
+							tmp.label1hr = 0;
+							tmp.label2hr = 0 ;
+							tmp.label3hr = 0 ;
+							tmp.label4hr = 0 ;
+							submit(tmp, sghypo) ;
+						}
+
+					}
+
+				}
+
+		}
+
+		//a custom composite to compute RHD
+		//add labelT as part of the tuple types
+		stream<GenericDataSchemaWithFlags, labelT, RHDFeatureN> rhdfeatureS = Custom(sghypo)
+		{
+			logic
+				state :
+				{
+					mutable map<int32, list<tuple<GenericDataSchemaWithFlags, labelT>>>
+						sgcollect = { } ;
+					mutable map<int32, list<tuple<GenericDataSchemaWithFlags, labelT>>>
+						hypocollect = { } ;
+					mutable tuple<GenericDataSchemaWithFlags, labelT, tuple<RHDFeatureN>>
+						rhdpk = { } ;
+				}
+
+	
+			onTuple sghypo :
+				{
+					if(ft == SG && ! has(sgcollect, PERSON_ID))
+					{
+						mutable list<tuple<GenericDataSchemaWithFlags, labelT>> sgtmp = [ ] ;
+						appendM(sgtmp, sghypo) ;
+						insertM(sgcollect, PERSON_ID, sgtmp) ;
+						mutable list<tuple<GenericDataSchemaWithFlags, labelT>> hypotmp = [ ] ;
+						//appendM(hypotmp,sghypo);
+						insertM(hypocollect, PERSON_ID, hypotmp) ;
+					}
+
+					else if(ft == SG && has(sgcollect, PERSON_ID))
+					{
+						if(size(sgcollect [ PERSON_ID ]) > 0)
+						{
+
+						//check collection window size and release SG in collection
+							mutable int32 numb = 0 ;
+							for(tuple<GenericDataSchemaWithFlags, labelT> x in sgcollect [
+								PERSON_ID ])
+							{
+							//check the window size
+								if(diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS) >(float64)(4 * 3600))
+								{
+									assignFrom(rhdpk, x) ;
+									rhdpk.sgcurrent = x.intValues [ SG_mgdL ] ;
+									rhdpk.EpochN =(int64) toTimeMillis(x.PUMP_TIME_TS) /(int64) 1000 ;
+									rhdpk.rhd1day =(float64) - 999 ;
+
+									//check the valid size of SG
+									if((size(sgcollect [ PERSON_ID ]) - numb) < 24)
+									{
+										rhdpk.rhd = getNullFloatValue() ; //assign NA to rhd
+										//submit the SG in collection
+										submit(rhdpk, rhdfeatureS) ;
+										numb ++ ;
+									}
+
+									else
+									{
+									//check the hypo collection
+										if(size(hypocollect [ PERSON_ID ]) == 0)
+										{
+										//if no hypo in the collection
+											rhdpk.rhd =(float64) 0 ; //assign zero to rhd
+											//submit the SG in collection
+											submit(rhdpk, rhdfeatureS) ;
+											numb ++ ;
+										}
+
+										else if(diffAsSecs(hypocollect [ PERSON_ID ] [ 0 ].PUMP_TIME_TS,
+											x.PUMP_TIME_TS) >=(float64) 0 && diffAsSecs(hypocollect [ PERSON_ID
+											] [ 0 ].PUMP_TIME_TS, x.PUMP_TIME_TS) <(float64)(4 * 3600))
+										{ //compute rhd
+											rhdpk.rhd =(float64) 240 - diffAsSecs(hypocollect [ PERSON_ID ] [ 0
+												].PUMP_TIME_TS, x.PUMP_TIME_TS) /(float64) 60 ;
+												//submit the SG in collection
+											submit(rhdpk, rhdfeatureS) ;
+											numb ++ ;
+										}
+										else if(diffAsSecs(hypocollect[PERSON_ID][0].PUMP_TIME_TS, x.PUMP_TIME_TS) >= (float64) (4*3600))
+										{
+											rhdpk.rhd=(float64) 0;
+											//submit SGs in the collection as 4 hours have passed
+											submit(rhdpk, rhdfeatureS);
+											numb++;
+										}
+										else
+										{
+											break ; //this is the case when sg timestamp is later than the first hypo, the sg needs to be on hold
+
+										}
+
+									}
+
+								}
+
+								else
+								{
+									break ;
+								}
+
+							}
+
+							//remove released ones from the sg collection
+							if(numb >(int32) 0)
+							{
+								removeM(sgcollect [ PERSON_ID ], 0, numb - 1) ;
+							}
+
+							//maintain hypo collection
+							if(size(hypocollect [ PERSON_ID ]) > 0 && size(sgcollect [ PERSON_ID ])
+								> 0)
+							{
+								mutable int32 numby = 0 ;
+								for(tuple<GenericDataSchemaWithFlags, labelT> y in hypocollect [
+									PERSON_ID ])
+								{
+									if(diffAsSecs(sgcollect [ PERSON_ID ] [ 0 ].PUMP_TIME_TS,
+										y.PUMP_TIME_TS) >(float64) 0)
+									{
+										numby ++ ;
+									}
+
+									else
+									{
+										break ;
+									}
+
+								}
+
+								if(numby >(int32) 0)
+								{
+									removeM(hypocollect [ PERSON_ID ], 0, numby - 1) ;
+								}
+
+							}
+
+						}
+
+						else
+						{ //list has no SG, then no release
+
+						}
+
+						//insert the new sg to sg collection
+						appendM(sgcollect [ PERSON_ID ], sghypo) ;
+					}
+
+					else if(ft == HYPOHYPER && has(hypocollect, PERSON_ID))
+					{ //if it is hypo packet
+					//insert the hypo collection
+						appendM(hypocollect [ PERSON_ID ], sghypo) ;
+					}
+
+				}
+		}
+		
+
+
+		stream<GenericDataSchemaWithFlags, labelT, RHDFeatureN> sghypo_stream = Functor(rhdfeatureS)
+		{
+			param
+				filter : ft == FIELDTYPE.SG ;
+			
+		}
+		
+		
+		/* instead of using the Aggregate composite, using the Custom composite to trace the sliding window for feature computing */		
+		stream<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet> SGfeatureStream = Custom(sghypo_stream){
+		
+			logic state: {
+				mutable map<int32,list<tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN>> > sgcollect = {};
+				mutable tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN, tuple<SGFeatureSet>> tmp = {};
+				mutable list<float64> sgvalue = [];
+				mutable list<float64> epochvalue = [];
+			}
+			
+			onTuple sghypo_stream:{
+			
+			    if(ft==SG && !has(sgcollect, PERSON_ID)){
+					mutable list<tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN>> sglist = [];
+					insertM(sgcollect,PERSON_ID,sglist);
+				}
+				if(ft==SG && has(sgcollect, PERSON_ID)){
+				
+					//insert the new sg to sg collection
+					appendM(sgcollect[PERSON_ID],sghypo_stream);
+					
+					//initial the SG feature set
+					assignFrom(tmp,sghypo_stream);
+					tmp.sglatest = intValues [ SG_mgdL ];
+					tmp.Epoch =(int64) toTimeMillis(PUMP_TIME_TS)/(int64)1000;
+					tmp.sgmean10min = getNullFloatValue(); 
+					tmp.sgmean15min = getNullFloatValue(); 
+					tmp.sgmean20min = getNullFloatValue(); 
+					tmp.sgmean30min = getNullFloatValue(); 
+					tmp.sgmean2hr = getNullFloatValue(); 
+					tmp.sgmean4hr = getNullFloatValue(); 
+					
+					tmp.sgmin30ago = getNullIntValue(); 
+					tmp.sg2hrago = getNullIntValue(); 
+					tmp.sg4hrago = getNullIntValue();
+					tmp.sglatestminusthirty = getNullIntValue();
+					tmp.sgthirtyminustwo = getNullIntValue();
+					tmp.sgtwominusfour = getNullIntValue();
+					
+					tmp.sgstdev30min = getNullFloatValue();
+					tmp.sgstdev2hr = getNullFloatValue();
+					tmp.sgstdev4hr = getNullFloatValue();
+					tmp.thirtyminslope = getNullFloatValue();
+					tmp.twohourslope = getNullFloatValue();
+					tmp.fourhourslope = getNullFloatValue(); 
+					
+					
+					if(size(sgcollect[PERSON_ID])>1){
+						
+						//compute the features by extract the specific window from collection
+						//window size include 4hr+30min, 4hr+20min, 4hr, 4hr-20min, 2hr+30min, 2hr+20min, 2hr, 2hr-20min, 
+						//30min+15min, 35min, 30min, 25min, 20min, 30min-15min, 10min
+						
+						mutable int32 numb = (int32) 0;
+						mutable int32 ix4h30m = 0; 		 //the starting index of T-4hr30min window
+						mutable int32 ix4h20m = 0; 		 //20m before 4h window
+						mutable int32 ix4h = 0;    		 //the index exactly on T-4hr
+						mutable int32 ix4hwin = 0; 		 //the starting index of T-4hr window
+						mutable int32 ix4hminus20m = 0;  //20m after 4h window
+						
+						mutable int32 ix2h30m = 0; 		 //the starting index of T-150min window
+						mutable int32 ix2h20m = 0;		 //20m before 2h window
+						mutable int32 ix2h = 0;    		 //the index exactly on T-2hr
+						mutable int32 ix2hwin = 0; 		 //the starting index of T-2hr window
+						mutable int32 ix2hminus20m = 0;	 //20m after 2h window
+						
+						mutable int32 ix45m = 0;  		 //the starting index of T-45min window
+						mutable int32 ix35m = 0;  		 //the starting index of T-35min window
+						mutable int32 ix30m15m = 0;		 //15m before 30m window
+						mutable int32 ix30m = 0;		 //the index exactly on T-30m
+						mutable int32 ix30mwin = 0;		 //the starting index of T-30min window
+						mutable int32 ix30mminus15m = 0; //15m after 30m window	
+						
+						mutable int32 ix25m = 0;  //the starting index of T-25min window
+						mutable int32 ix20m = 0;  //the starting index of T-20min window
+						mutable int32 ix15m = 0;  //the starting index of T-15min window
+						mutable int32 ix10m = 0;  //the starting index of T-10min window
+						
+						//default to 1200, which is the maximum time diff between T and T-20m
+						mutable float64 diff4h20m = (float64)1200;			//time between T-4h and sg TS found between T-4h20m and T-4h
+						mutable float64 diff4hminus20m = (float64)1200;		//time between T-4h and sg TS found between T-4h and T-(4h-20m)
+						mutable float64 diff2h20m = (float64)1200;			//time between T-2h and sg TS found between T-2h20m and T-2h
+						mutable float64 diff2hminus20m = (float64)1200;		//time between T-2h and sg TS found between T-2h and T-(2h-20m)
+						mutable float64 diff30m15m = (float64)1200;			//time between T-30 and sg TS found between T-45m and T-30
+						mutable float64 diff30mminus15m = (float64)1200;	//time between T-30 and sg TS found between T-30 and T-(30m-15m)
+						
+						for(tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN> x in sgcollect[PERSON_ID]){
+							appendM(sgvalue, (float64) x.intValues[SG_mgdL]);
+							appendM(epochvalue, (float64) toTimeMillis(x.PUMP_TIME_TS)/(float64)1000);
+							numb++;
+							mutable float64 diff = diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS);
+							
+							//check the specific time
+							
+							//the following window indexes requires updated only once
+							//ix4h30m, ix4h, ix2h30m, ix2h, ix45m, ix35m, ix30m, ix25m, ix20m, ix15m, ix10m
+							//ix4hminus20m, diff4hminus20m, ix2hminus20m, diff2hminus20m, ix30mminus15m, diff30mminus15m
+							
+							//the following window indexes may updated multiple times till the nearest one found
+							//ix4h20m, diff4h20m, x2h20m, diff2h20m, ix30m15m, diff30m15m
+							
+							//if ix4h30m has not been updated 
+							if(ix4h30m==0 && diff <= (float64)(4*3600+30*60) && diff> (float64)0){
+								ix4h30m=numb;
+							}
+							//if ix4h has not been updated 
+							if(ix4h==0 && diff == (float64)(4*3600)){
+								ix4h=numb;
+							}
+							//if ix4hwin has not been updated  
+							if(ix4hwin==0 && diff <= (float64)(4*3600) && diff> (float64)0){
+								ix4hwin=numb;
+							}
+							//if ix4hminus20m has not been updated  
+							if(ix4hminus20m==0 && diff >= (float64)(4*3600-20*60) && diff < (float64)(4*3600)){
+								ix4hminus20m=numb; diff4hminus20m = (float64)(4*3600) - diff;
+							}
+							//ix4h20m-1 is the closest index to 4hr plus
+							if(diff <= (float64)(4*3600+20*60) && diff > (float64)(4*3600)){
+								ix4h20m=numb; diff4h20m = diff - (float64)(4*3600);
+							}
+							//if ix2h30m has not been updated   
+							if(ix2h30m==0 && diff <= (float64)(2*3600+30*60) && diff> (float64)0){
+								ix2h30m=numb;
+							}
+							//if ix2h has not been updated 
+							if(ix2h==0 && diff == (float64)(2*3600)){
+								ix2h=numb;
+							}
+							//if ix2hwin has not been updated 
+							if(ix2hwin==0 && diff <= (float64)(2*3600) && diff> (float64)0){
+								ix2hwin=numb;
+							}
+							//if ix2hminus20m-1 has not been updated 
+							if(ix2hminus20m==0 && diff >= (float64)(2*3600-20*60) && diff < (float64)(2*3600)){
+								ix2hminus20m=numb; diff2hminus20m = (float64)(2*3600) - diff;
+							}
+							//ix2h20m-1 is the closest index to 2hr plus
+							if(diff <= (float64)(2*3600+20*60) && diff > (float64)(2*3600)){
+								ix2h20m=numb; diff2h20m = diff - (float64)(2*3600);
+							}
+							//if ix45m has not been updated 
+							if(ix45m==0 && diff <= (float64)(45*60) && diff> (float64)0){
+								ix45m=numb;
+							}
+							//if ix35m has not been updated 
+							if(ix35m==0 && diff <= (float64)(35*60) && diff> (float64)0){
+								ix35m=numb;
+							}
+							//if ix30m has not been updated 
+							if(ix30m==0 && diff == (float64)(30*60)){
+								ix30m=numb;
+							}
+							//if ix30mwin has not been updated 
+							if(ix30mwin==0 && diff <= (float64)(30*60) && diff> (float64)0){
+								ix30mwin=numb;
+							}
+							//if ix30mminus15m-1 has not been updated 
+							if(ix30mminus15m==0 && diff >= (float64)(15*60) && diff < (float64)(30*60)){
+								ix30mminus15m=numb; diff30mminus15m = (float64)(30*60) - diff;
+							}
+							//ix30m15m is the closest index to 30min plus
+							if(diff <= (float64)(45*60) && diff > (float64)(30*60)){
+								ix30m15m=numb; diff30m15m = diff - (float64)(30*60);
+							}
+							//if ix25m has not been updated 
+							if(ix25m==0 && diff <= (float64)(25*60) && diff> (float64)0){
+								ix25m=numb;
+							}
+							//if ix20m has not been updated 
+							if(ix20m==0 && diff <= (float64)(20*60) && diff> (float64)0){
+								ix20m=numb;
+							}
+							//if ix15m has not been updated 
+							if(ix15m==0 && diff <= (float64)(15*60) && diff> (float64)0){
+								ix15m=numb;
+							}
+							//if ix10m has not been updated 
+							if(ix10m==0 && diff <= (float64)(10*60) && diff> (float64)0){
+								ix10m=numb;
+							}
+							
+						}
+						
+						//compute sg mean, sg stddev, sg slope
+						if(ix10m==0){ //no sg between T and T-10min
+							if(ix20m>0){
+								tmp.sgmean10min = avg(slice(sgvalue, ix20m-1,size(sgvalue)-ix20m+1));
+							}
+							else{
+								tmp.sgmean10min = (float64) -999;
+							}
+						}
+						else{
+							tmp.sgmean10min = avg(slice(sgvalue, ix10m-1,size(sgvalue)-ix10m+1));
+						}
+						
+						if(ix15m==0){ //no sg between T and T-15min
+							if(ix25m>0){
+								tmp.sgmean15min = avg(slice(sgvalue, ix25m-1,size(sgvalue)-ix25m+1));
+							}
+							else{
+								tmp.sgmean15min = (float64) -999;
+							}
+						}
+						else{
+							tmp.sgmean15min = avg(slice(sgvalue, ix15m-1,size(sgvalue)-ix15m+1));
+						}
+						
+						if(ix20m==0){ //no sg between T and T-20min
+							if(ix35m>0){
+								tmp.sgmean20min = avg(slice(sgvalue, ix35m-1,size(sgvalue)-ix35m+1));
+							}
+							else{
+								tmp.sgmean20min = (float64) -999;
+							}
+						}
+						else{
+							tmp.sgmean20min = avg(slice(sgvalue, ix20m-1,size(sgvalue)-ix20m+1));
+						}
+						
+						if(ix30mwin==0){ //no sg between T and T-30min
+							if(ix45m>0){
+								tmp.sgmean30min = avg(slice(sgvalue, ix45m-1,size(sgvalue)-ix45m+1));
+								tmp.sgstdev30min = stddev(slice(sgvalue, ix45m-1,size(sgvalue)-ix45m+1));
+								tmp.thirtyminslope = SGslope(slice(sgvalue, ix45m-1,size(sgvalue)-ix45m+1), 
+														  slice(epochvalue, ix45m-1,size(epochvalue)-ix45m+1));
+							}
+							else{
+								tmp.sgmean30min = (float64) -999;
+								tmp.sgstdev30min = (float64) -999;
+								tmp.thirtyminslope = (float64) -999;
+							}
+							
+						}
+						else{
+							tmp.sgmean30min = avg(slice(sgvalue, ix30mwin-1,size(sgvalue)-ix30mwin+1));
+							tmp.sgstdev30min = stddev(slice(sgvalue, ix30mwin-1,size(sgvalue)-ix30mwin+1));
+							tmp.thirtyminslope = SGslope(slice(sgvalue, ix30mwin-1,size(sgvalue)-ix30mwin+1), 
+													  slice(epochvalue, ix30mwin-1,size(epochvalue)-ix30mwin+1));
+						}
+						
+						if(ix2hwin==0){ //no sg between T and T-2hr
+							if(ix2h30m>0){
+								tmp.sgmean2hr = avg(slice(sgvalue, ix2h30m-1,size(sgvalue)-ix2h30m+1));
+								tmp.sgstdev2hr = stddev(slice(sgvalue, ix2h30m-1,size(sgvalue)-ix2h30m+1));
+								tmp.twohourslope = SGslope(slice(sgvalue, ix2h30m-1,size(sgvalue)-ix2h30m+1), 
+														  slice(epochvalue, ix2h30m-1,size(epochvalue)-ix2h30m+1));
+							}
+							else{
+								tmp.sgmean2hr = (float64) -999;
+								tmp.sgstdev2hr = (float64) -999;
+								tmp.twohourslope = (float64) -999;
+							}
+						}
+						else{
+							tmp.sgmean2hr = avg(slice(sgvalue, ix2hwin-1,size(sgvalue)-ix2hwin+1));
+							tmp.sgstdev2hr = stddev(slice(sgvalue, ix2hwin-1,size(sgvalue)-ix2hwin+1));
+							tmp.twohourslope = SGslope(slice(sgvalue, ix2hwin-1,size(sgvalue)-ix2hwin+1), 
+													  slice(epochvalue, ix2hwin-1,size(epochvalue)-ix2hwin+1));
+						}
+						
+						if(ix4hwin==0){ //no sg between T and T-4hr
+							if(ix4h30m>0){
+								tmp.sgmean4hr = avg(slice(sgvalue, ix4h30m-1,size(sgvalue)-ix4h30m+1));
+								tmp.sgstdev4hr = stddev(slice(sgvalue, ix4h30m-1,size(sgvalue)-ix4h30m+1));
+								tmp.fourhourslope = SGslope(slice(sgvalue, ix4h30m-1,size(sgvalue)-ix4h30m+1), 
+														  slice(epochvalue, ix4h30m-1,size(epochvalue)-ix4h30m+1));
+							}
+							else{
+								tmp.sgmean4hr = (float64) -999;
+								tmp.sgstdev4hr = (float64) -999;
+								tmp.fourhourslope = (float64) -999;
+							}
+						}
+						else{
+							tmp.sgmean4hr = avg(slice(sgvalue, ix4hwin-1,size(sgvalue)-ix4hwin+1));
+							tmp.sgstdev4hr = stddev(slice(sgvalue, ix4hwin-1,size(sgvalue)-ix4hwin+1));
+							tmp.fourhourslope = SGslope(slice(sgvalue, ix4hwin-1,size(sgvalue)-ix4hwin+1), 
+													  slice(epochvalue, ix4hwin-1,size(epochvalue)-ix4hwin+1));
+						}
+						
+						//compute sg ago
+						if(ix30m==0){ //no sg on exact 30min ago
+							if(ix30mminus15m>0 && ix30m15m>0){
+								if(diff30mminus15m<=diff30m15m){  //Note: if both distance is equal, on decision regarding which side we will use, we use the side of the future
+									tmp.sgmin30ago = (int32) sgvalue[ix30mminus15m-1];
+								}
+								else{
+									tmp.sgmin30ago = (int32) sgvalue[ix30m15m-1];
+								}
+							}
+							else if(ix30mminus15m>0){
+								tmp.sgmin30ago = (int32) sgvalue[ix30mminus15m-1];
+							}
+							else if(ix30m15m>0){
+								tmp.sgmin30ago = (int32) sgvalue[ix30m15m-1];
+							}
+							else{
+								tmp.sgmin30ago = -999;
+							}
+						}
+						else{
+							tmp.sgmin30ago = (int32) sgvalue[ix30m-1];
+						}
+						
+						if(ix2h==0){ //no sg on exact 2hr ago
+							if(ix2hminus20m>0 && ix2h20m>0){
+								if(diff2hminus20m<=diff2h20m){
+									tmp.sg2hrago = (int32) sgvalue[ix2hminus20m-1];
+								}
+								else{
+									tmp.sg2hrago = (int32) sgvalue[ix2h20m-1];
+								}
+							}
+							else if(ix2hminus20m>0){
+									tmp.sg2hrago = (int32) sgvalue[ix2hminus20m-1];
+							}
+							else if(ix2h20m>0){
+									tmp.sg2hrago = (int32) sgvalue[ix2h20m-1];
+							}
+							else{
+									tmp.sg2hrago = -999;
+							}
+						}
+						else{
+							tmp.sg2hrago = (int32) sgvalue[ix2h-1];
+						}
+						
+						if(ix4h==0){ //no sg on exact 4hr ago
+							if(ix4hminus20m>0 && ix4h20m>0){
+								if(diff4hminus20m<=diff4h20m){
+									tmp.sg4hrago = (int32) sgvalue[ix4hminus20m-1];
+								}
+								else{
+									tmp.sg4hrago = (int32) sgvalue[ix4h20m-1];
+								}
+							}
+							else if(ix4hminus20m>0){
+									tmp.sg4hrago = (int32) sgvalue[ix4hminus20m-1];
+							}
+							else if(ix4h20m>0){
+									tmp.sg4hrago = (int32) sgvalue[ix4h20m-1];
+							}
+							else{
+									tmp.sg4hrago = -999;
+							}
+						}
+						else{
+							tmp.sg4hrago = (int32) sgvalue[ix4h-1];
+						}
+						
+						
+						//compute sg minus
+						if(tmp.sgmin30ago!=-999){
+							tmp.sglatestminusthirty = tmp.sglatest - tmp.sgmin30ago;
+						}
+						else{
+							tmp.sglatestminusthirty = -999;
+						}
+						if(tmp.sgmin30ago!=-999 && tmp.sg2hrago!=-999){
+							tmp.sgthirtyminustwo = tmp.sgmin30ago - tmp.sg2hrago;
+						}
+						else{
+							tmp.sgthirtyminustwo = -999;
+						}
+						if(tmp.sg2hrago!=-999 && tmp.sg4hrago!=-999){
+							tmp.sgtwominusfour = tmp.sg2hrago - tmp.sg4hrago;
+						}
+						else{
+							tmp.sgtwominusfour = -999;
+						}
+						
+					
+						//clean up the sgvalue list
+						clearM(sgvalue);
+						clearM(epochvalue);
+						
+						//maintain the window with max period of 4 hours and 30min and also maintain the summary of the total sg values
+						mutable int32 numbr= 0;
+						for(tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN> x in sgcollect[PERSON_ID]){
+							if( diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS) > (float64)(4*3600+30*60)){
+								numbr++;
+							}
+							else{
+								break;
+							}
+						}
+						if(numbr>(int32)0){
+							removeM(sgcollect[PERSON_ID],0,numbr-1);
+						}
+					
+						
+					}
+					else{ //there is no or a single/current SG in collection, then continue with no action
+						
+					}
+
+					//submit the current SG result
+					submit(tmp, SGfeatureStream);
+					
+				}
+				else{ //the tuple is non-SG type, drop it from the stream
+				
+				}
+			}
+		}
+					
+		//a custom composite to compute RHD
+		stream<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet, recentHypoN> featureStream10 = Custom(SGfeatureStream){
+		
+			logic state: {
+				mutable map<int32,list<tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet>> > rgcollect = {};
+				mutable tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet, tuple<recentHypoN>> tmp = {};
+			}
+			
+			onTuple SGfeatureStream:{
+			
+			    if(!has(rgcollect, PERSON_ID)){
+					mutable list<tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet>> rglist = [];
+					insertM(rgcollect,PERSON_ID,rglist);
+				}
+				if(has(rgcollect, PERSON_ID)){			
+					//insert the new tuple to collection
+					appendM(rgcollect[PERSON_ID],SGfeatureStream);
+					
+					//initial the feature set
+					assignFrom(tmp,SGfeatureStream);
+					tmp.recentHypo1hr = 0;
+					tmp.recentHypo2hr = 0;
+					tmp.recentHypo6hr = 0;
+					tmp.recentHypo1Day = 0;
+					tmp.recentHypo3Day = 0;
+					tmp.recentHypo7Day = 0;
+					tmp.recentHypo14Day = 0;
+					tmp.recentHypo30Day = 0;
+					tmp.recentHypo1to3Day = 0;
+					tmp.recentHypo3to7Day = 0;
+					tmp.recentHypo7to14Day = 0;
+					tmp.recentHypo14to30Day = 0;
+					
+					if(size(rgcollect[PERSON_ID])>0){
+						
+						//maintain a count for the 30-day sliding window
+						mutable int32 numbr= 0;
+							
+						for(tuple<GenericDataSchemaWithFlags, labelT, RHDFeatureN, SGFeatureSet> x in rgcollect[PERSON_ID]){
+							mutable float64 diff = diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS);
+							
+							if (diff <= (float64)(30*24*3600)){  //30 days
+								tmp.recentHypo30Day = tmp.recentHypo30Day + x.hypo;
+								
+								if (diff <= (float64)(14*24*3600)){  //14 days
+									tmp.recentHypo14Day = tmp.recentHypo14Day + x.hypo;
+									
+									if (diff <= (float64)(7*24*3600)){  //7 days
+										tmp.recentHypo7Day = tmp.recentHypo7Day + x.hypo;
+										
+										if (diff <= (float64)(3*24*3600)){  //3 days
+											tmp.recentHypo3Day = tmp.recentHypo3Day + x.hypo;
+											
+											if (diff <= (float64)(24*3600)){  //1 days
+												tmp.recentHypo1Day = tmp.recentHypo1Day + x.hypo;
+												
+												if (diff <= (float64)(6*3600)){  //6 hours
+													tmp.recentHypo6hr = tmp.recentHypo6hr + x.hypo;
+													
+													if (diff <= (float64)(2*3600)){  //2 hours
+														tmp.recentHypo2hr = tmp.recentHypo2hr + x.hypo;
+														
+														if (diff <= (float64)(3600)){  //1 hours
+															tmp.recentHypo1hr = tmp.recentHypo1hr + x.hypo;
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+							else{
+								numbr++;
+							}
+						}
+						
+						//maintain a 30-day sliding window
+						if(numbr>(int32)0){
+							removeM(rgcollect[PERSON_ID],0,numbr-1);
+						}
+						
+						tmp.recentHypo1to3Day=tmp.recentHypo3Day-tmp.recentHypo1Day;
+						tmp.recentHypo3to7Day=tmp.recentHypo7Day-tmp.recentHypo3Day;
+						tmp.recentHypo7to14Day=tmp.recentHypo14Day-tmp.recentHypo7Day;
+						tmp.recentHypo14to30Day=tmp.recentHypo30Day-tmp.recentHypo14Day;
+						
+						//submit the current result
+						submit(tmp, featureStream10);
+						
+					}
+				}
+			}
+		}
+					
+
+		//1 day past window
+		stream<GenericDataSchemaWithFlags, labelT, RHDFeatureN, recentHypoN, SGFeatureSet> featureStream11 = Aggregate(featureStream10){
+			logic
+				state :
+				{
+					mutable CollectRHD collectrhd ;
+				}
+
+			window
+			//note the window is defined as 1 days from the current time
+				featureStream10 : sliding, delta(PUMP_TIME_TS,(float64)(24 * 3600)),
+					count(1), partitioned ;
+			param
+				partitionBy : PERSON_ID ;
+			output
+				featureStream11 :
+				//output the last SG in the window since this is the past window
+				sglatest = Last(sglatest), Epoch = Last(Epoch), rhd = Last(rhd), rhd1day =
+					Custom(initRHD1D(collectrhd), processRHD1D(rhd, Epoch, collectrhd),
+					computeRHD1D(collectrhd)) ;
+		}
+
+		
+		//output sink
+		stream<featureVectorStrT> formattedOutput = Functor(featureStream11){
+			output
+				formattedOutput : Epoch_s =(rstring) Epoch, hypo_s =(rstring) hypo,
+					label2hr_s =(rstring) label2hr, label3hr_s =(rstring) label3hr,
+					label4hr_s =(rstring) label4hr, recentHypo1hr_s = convertToNA((rstring)
+					recentHypo1hr), recentHypo2hr_s = convertToNA((rstring) recentHypo2hr),
+					recentHypo6hr_s = convertToNA((rstring) recentHypo6hr),
+					recentHypo1Day_s = convertToNA((rstring) recentHypo1Day),
+					recentHypo3Day_s = convertToNA((rstring) recentHypo3Day),
+					recentHypo7Day_s = convertToNA((rstring) recentHypo7Day),
+					recentHypo14Day_s = convertToNA((rstring) recentHypo14Day),
+					recentHypo30Day_s = convertToNA((rstring) recentHypo30Day),
+					recentHypo1to3Day_s = convertToNA((rstring) recentHypo1to3Day),
+					recentHypo3to7Day_s = convertToNA((rstring) recentHypo3to7Day),
+					recentHypo7to14Day_s = convertToNA((rstring) recentHypo7to14Day),
+					recentHypo14to30Day_s = convertToNA((rstring) recentHypo14to30Day),
+					rhd_s = convertToNA((rstring) formatNumber(rhd, 5u, 2u, false)),
+					rhd1day_s = convertToNA((rstring) formatNumber(rhd1day, 5u, 2u, false)),
+					dayofweek_s = convertToNA((rstring) dayOfWeek(PUMP_TIME_TS)),
+					hourofday_s = convertToNA((rstring) gmhour(PUMP_TIME_TS)),
+					PERSON_ID_s =(rstring) PERSON_ID, 
+					sglatest_s = convertToNA((rstring)sglatest), 
+					sgmean10min_s = convertToNA((rstring)formatNumber(sgmean10min, 5u, 2u, false)), 
+					sgmean15min_s = convertToNA((rstring) formatNumber(sgmean15min, 5u, 2u, false)),
+					sgmean20min_s = convertToNA((rstring) formatNumber(sgmean20min, 5u, 2u, false)), 
+					sgmean30min_s = convertToNA((rstring) formatNumber(sgmean30min, 5u, 2u, false)), 
+					sgmean2hr_s = convertToNA((rstring)formatNumber(sgmean2hr, 5u, 2u, false)), 
+					sgmean4hr_s = convertToNA((rstring) formatNumber(sgmean4hr, 5u, 2u, false)),
+					sgmin30ago_s = convertToNA((rstring) sgmin30ago), 
+					sg2hrago_s = convertToNA((rstring) sg2hrago), 
+					sg4hrago_s = convertToNA((rstring) sg4hrago), 
+					sglatestminusthirty_s = convertToNA((rstring) sglatestminusthirty), 
+					sgthirtyminustwo_s = convertToNA((rstring) sgthirtyminustwo), 
+					sgtwominusfour_s = convertToNA((rstring) sgtwominusfour), 
+					sgstdev30min_s = convertToNA((rstring) formatNumber(sgstdev30min, 5u, 3u, false)), 
+					sgstdev2hr_s = convertToNA((rstring) formatNumber(sgstdev2hr, 5u, 3u, false)),
+					sgstdev4hr_s = convertToNA((rstring) formatNumber(sgstdev4hr, 5u, 3u, false)), 
+					thirtyminslope_s = convertToNA((rstring) formatNumber(thirtyminslope, 5u, 3u, false)), 
+					twohourslope_s = convertToNA((rstring) formatNumber(twohourslope, 5u, 3u, false)),
+					fourhourslope_s = convertToNA((rstring) formatNumber(fourhourslope, 5u, 3u, false)),
+					HypoStatus_s =(rstring) HypoStatus,
+					label30min_s =(rstring) label30min,
+					label1hr_s =(rstring) label1hr
+					;
+		}
+}
+
+			
+		
+

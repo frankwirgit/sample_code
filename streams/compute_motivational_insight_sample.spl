@@ -1,0 +1,449 @@
+/* An example to compute a group of motivation insight which have been generated and triggered by similar hypo events */
+
+namespace com.ibm.mdt.insights.motivational ;
+
+use com.ibm.mdt.spltypes::* ;
+use com.ibm.mdt.utils::* ;
+
+
+/*
+Motivational Insight Feature M25, M26, M27, M28, M29
+1. Food bw is considered as the bw wizard with carb > 0g
+2. Calculate hypo/hyper episode count from 0-4 hours post food bw in the last month
+3. Food bw with hypo episodes in last month * 28 / total food bw count <= 7
+Where last month = 12AM on 1st to 12AM on 1st of current month
+
+Minimum SG required: 4 Hour PostMealWindow month = 240 packets
+Do not show if >25% SG packets are found invalid due data cleaning in the evaluation time
+compute time: 12AM on 1st of every month
+deliver time: 5PM 1st of the month
+compute/deliver frequency: Not to be repeated in a month
+*/
+
+type HBW = int32 PERSON_ID, timestamp PUMP_TIME_TS, int32 total_sg, int32 valid_sg, int32 inrange_sg, int32 high_sg, int32 low_sg, 
+			  int32 hypo_count, int32 hyper_count, int32 total_bw;
+			  
+public HBW initializeBW(timestamp ts, HBW EB)
+{
+	mutable HBW tmp = { } ;
+	tmp.PERSON_ID = EB.PERSON_ID;
+	tmp.PUMP_TIME_TS = ts;
+	
+	tmp.total_sg = EB.total_sg; 
+	tmp.valid_sg = EB.valid_sg;
+	tmp.inrange_sg = EB.inrange_sg;
+	tmp.high_sg = EB.high_sg;
+	tmp.low_sg = EB.low_sg;
+	tmp.total_bw = EB.total_bw;
+	
+	tmp.hypo_count = EB.hypo_count; 
+	tmp.hyper_count = EB.hyper_count; 
+	return tmp ;
+}
+
+public composite M25_M26_M27_M28_M29_stream(input masterStream; output EBWout, countSum, M25_Hypo4hMeal, M26_Hyper4hMeal, M27_InRange4hMeal, M28_HighRange4hMeal, M29_LowRange4hMeal) {
+//public composite M25_M26_M27_M28_M29_stream(input masterStream; output EBWout, countSum) {
+
+param
+	expression<float64> $hyper_episode_threshold:7.0;
+	expression<float64> $hypo_episode_threshold:2.0;
+	expression<int32> $bw_per_month: 28;
+	
+	expression<int32> $inrangepct:75;
+	expression<int32> $highrangepct:25;
+	expression<int32> $lowrangepct:5;
+			
+	expression<float64> $sgwindow : 4.0*60.0*60.0; //four hours
+	expression<int32> $sgmin : 240; //minimum counts of SG in a month
+	expression<float64> $sgvalid_pct : 75.0; 
+	
+	
+	expression<uint32> $deliverhour:(uint32)17; //5PM
+	expression<rstring> $dpsconfig;
+	
+graph
+	
+	stream<GenericDataSchemaWithFlags,tuple<int32 triggernum>> BWout = EBWSGstream(masterStream) {
+		param
+			period:MONTHLY;
+	}
+	
+	//add the hypo episode
+	stream<GenericDataSchemaWithFlags,tuple<int32 triggernum>> HypoBWout = add_hypo_to_composite(BWout) {
+		param
+			dpsconfig:$dpsconfig;
+		
+	}
+	
+	//add the hyper episode
+	stream<GenericDataSchemaWithFlags,tuple<int32 triggernum>> EBWout = add_hyper_to_composite(HypoBWout) {
+		param
+			dpsconfig:$dpsconfig;
+	}
+
+	 
+	stream<HBW> countSum = Custom(EBWout) {
+		
+		logic state: {
+			mutable map<int32, int32> month_number = {};
+			mutable map<int32,list<tuple<HBW> > > bw_set = {};
+			mutable map<int32, HBW> BWStatus = {};
+			mutable map<int32, HBW> BWTotal = {};   //current month
+			//mutable map<int32, HBW> BWTotal_last = {};  //last month
+			mutable map<int32, boolean> reset_start = {};
+			//mutable map<int32, boolean> reset_deliver = {};
+			int32 NULLVAL = -1;
+			mutable uint64 _storeHandle = getDPSThresholdStoreHandle($dpsconfig);
+		}
+		
+		onTuple EBWout:{
+		
+			if(!has(month_number,PERSON_ID)){  //initialize the flags
+			
+				insertM(month_number,PERSON_ID, triggernum);
+				insertM(reset_start,PERSON_ID,false);
+				//insertM(reset_deliver,PERSON_ID,false);
+				
+				mutable list<HBW> tmpList = [];
+				insertM(bw_set, PERSON_ID, tmpList);
+					
+				mutable HBW tmp ={};
+				tmp.PERSON_ID=PERSON_ID;
+				tmp.PUMP_TIME_TS=PUMP_TIME_TS;
+				tmp.total_sg = 0; 
+				tmp.valid_sg = 0;
+				tmp.inrange_sg = 0;
+				tmp.high_sg = 0;
+				tmp.low_sg = 0;
+				tmp.hypo_count = 0; 
+				tmp.hyper_count = 0; 
+				tmp.total_bw = 0;
+				
+				insertM(BWStatus, PERSON_ID, tmp);
+				insertM(BWTotal, PERSON_ID, tmp);
+				//insertM(BWTotal_last, PERSON_ID, tmp);
+				
+			
+			}
+		
+			if(has(month_number,PERSON_ID)){
+			
+				//when reach to the new month
+				if(ft!=HYPOHYPER && (triggernum - month_number[PERSON_ID] ==1) && reset_start[PERSON_ID]){ 
+					//printStringLn("new month="+(rstring)triggernum);
+					//update the month number and reset total flag
+					month_number[PERSON_ID]=triggernum;
+					reset_start[PERSON_ID]=false;
+						
+					//save the current value to the old month
+					//( BWTotal_last[PERSON_ID]=initializeBW(BWTotal[PERSON_ID].PUMP_TIME_TS, BWTotal[PERSON_ID]);
+					
+					
+					//submit the BWTotal
+					
+					//BWTotal[PERSON_ID].PUMP_TIME_TS = add(todayStart(BWTotal[PERSON_ID].PUMP_TIME_TS), (float64)(17*3600));
+					BWTotal[PERSON_ID].PUMP_TIME_TS = add(PUMP_TIME_TS, (float64)(17*3600));
+					submit(BWTotal[PERSON_ID], countSum);
+					printStringLn("check last month="+ (rstring)getTimeStampString(BWTotal[PERSON_ID].PUMP_TIME_TS) + 
+					" total_sg=" + (rstring)BWTotal[PERSON_ID].total_sg + " valid_sg=" + (rstring)BWTotal[PERSON_ID].valid_sg + 
+					" inrange_sg=" + (rstring)BWTotal[PERSON_ID].inrange_sg + " high_sg=" + (rstring)BWTotal[PERSON_ID].high_sg + " low_sg=" + (rstring)BWTotal[PERSON_ID].low_sg + 
+					" hypo=" + (rstring)BWTotal[PERSON_ID].hypo_count+" hyper=" + (rstring)BWTotal[PERSON_ID].hyper_count+
+					" total_bw=" + (rstring)BWTotal[PERSON_ID].total_bw);
+					
+				}
+				else if(ft!=HYPOHYPER && (triggernum - month_number[PERSON_ID] > 1) && reset_start[PERSON_ID]){ 
+					//miss one or multiple months data
+					//no send insight but need to update the month
+					month_number[PERSON_ID]=triggernum;
+					reset_start[PERSON_ID]=false;
+				}
+				
+				
+				//to compute - as far as it is the current month data
+				if(ft!=DUMMY && (triggernum - month_number[PERSON_ID] == 0)){
+				
+					//to deliver - check if the time clock reaches to 5PM on the first day of the month
+					/* if(ft!=HYPOHYPER && (int32)gmday(PUMP_TIME_TS)==1 && gmhour(PUMP_TIME_TS) == $deliverhour && !reset_deliver[PERSON_ID]){
+						submit(BWTotal[PERSON_ID], countSum);
+						reset_deliver[PERSON_ID]=true;
+					}
+					else if(ft!=HYPOHYPER  && (int32)gmday(PUMP_TIME_TS)==2){ //once pass the first day, reset the delivery flag
+						reset_deliver[PERSON_ID]=false;
+					} */
+					
+				
+					if(!reset_start[PERSON_ID]){
+						//reset the BW total counts for the current month
+						//printStringLn("month="+(rstring)month_number[PERSON_ID]);
+						reset_start[PERSON_ID]=true;
+						BWTotal[PERSON_ID].PUMP_TIME_TS = PUMP_TIME_TS; //not necessary
+						BWTotal[PERSON_ID].total_sg = 0;
+						BWTotal[PERSON_ID].valid_sg = 0;
+						BWTotal[PERSON_ID].inrange_sg = 0;
+						BWTotal[PERSON_ID].high_sg = 0;
+						BWTotal[PERSON_ID].low_sg = 0;
+						BWTotal[PERSON_ID].hypo_count = 0;
+						BWTotal[PERSON_ID].hyper_count = 0;
+						BWTotal[PERSON_ID].total_bw = 0;
+					}
+					
+					
+					//check if the 4 hour window has been reached, then summarize the current counts
+					if(ft!=HYPOHYPER && size(bw_set[PERSON_ID])>(int32)0 && diffAsSecs(PUMP_TIME_TS, bw_set[PERSON_ID][0].PUMP_TIME_TS)>$sgwindow){
+						//submit any bw from the buffer if the current pump time exceed window size
+						
+						mutable int32 numb = (int32)0;
+						for(tuple<HBW> x in (bw_set[PERSON_ID])) {
+							if(diffAsSecs(PUMP_TIME_TS, x.PUMP_TIME_TS)>$sgwindow){
+								BWTotal[PERSON_ID].total_sg = BWTotal[PERSON_ID].total_sg + (BWStatus[PERSON_ID].total_sg - x.total_sg);
+								BWTotal[PERSON_ID].valid_sg = BWTotal[PERSON_ID].valid_sg + (BWStatus[PERSON_ID].valid_sg - x.valid_sg);
+								BWTotal[PERSON_ID].inrange_sg = BWTotal[PERSON_ID].inrange_sg + (BWStatus[PERSON_ID].inrange_sg - x.inrange_sg);
+								BWTotal[PERSON_ID].high_sg = BWTotal[PERSON_ID].high_sg + (BWStatus[PERSON_ID].high_sg - x.high_sg);
+								BWTotal[PERSON_ID].low_sg = BWTotal[PERSON_ID].low_sg + (BWStatus[PERSON_ID].low_sg - x.low_sg);
+								
+								BWTotal[PERSON_ID].hypo_count = BWTotal[PERSON_ID].hypo_count + (BWStatus[PERSON_ID].hypo_count - x.hypo_count);
+								BWTotal[PERSON_ID].hyper_count = BWTotal[PERSON_ID].hyper_count + (BWStatus[PERSON_ID].hyper_count - x.hyper_count);
+								BWTotal[PERSON_ID].total_bw = BWTotal[PERSON_ID].total_bw + (int32)1;
+								//printStringLn("add BW="+ (rstring)getTimeStampString(x.PUMP_TIME_TS) + " total_sg=" + 
+								//(rstring)(BWStatus[PERSON_ID].total_sg - x.total_sg) + " hypo=" + (rstring)(BWStatus[PERSON_ID].hypo_count - x.hypo_count));
+								
+								numb++;
+							}
+						}
+						//remove the submitted bwes
+						if(numb>(int32)0){
+							removeM(bw_set[PERSON_ID],0,numb-1);
+						}
+						//printStringLn("check total="+ (rstring)getTimeStampString(BWTotal[PERSON_ID].PUMP_TIME_TS) + " total_sg=" + 
+						//(rstring)BWTotal[PERSON_ID].total_sg + " hypo=" + (rstring)BWTotal[PERSON_ID].hypo_count);
+					}
+					
+					if(ft==BW){
+						//if it is BW defined as food bw, initialize its properties and push to the buffer 
+						mutable HBW tmpBW = initializeBW(PUMP_TIME_TS, BWStatus[PERSON_ID]);
+						appendM(bw_set[PERSON_ID], tmpBW);
+						//count total BW
+						BWStatus[PERSON_ID].total_bw=BWStatus[PERSON_ID].total_bw+(int32)1;
+					}
+					
+					else if(ft==SG){
+						//keep updating the SG numbers
+						BWStatus[PERSON_ID].total_sg=BWStatus[PERSON_ID].total_sg+(int32)1;
+						
+						//count valid SG
+						if(!flagValues[OUTOFRANGE] && !flagValues[OVERLAP1] && !flagValues[OVERLAP2] && !flagValues[ARTIFACT1] && !flagValues[ARTIFACT2] && !flagValues[INACCURATE] && intValues[SG_mgdL]!= NULLVAL){
+							BWStatus[PERSON_ID].valid_sg=BWStatus[PERSON_ID].valid_sg+(int32)1;
+						}
+							
+						//count if the sg stays within glucose range, or in high or low glucose range
+						if(intValues[SG_mgdL]!= NULLVAL){
+							if(intValues[SG_mgdL]>getHyperThreshold(PERSON_ID,_storeHandle)){
+								BWStatus[PERSON_ID].high_sg=BWStatus[PERSON_ID].high_sg+1;
+							}
+							else if(intValues[SG_mgdL]<getHypoThreshold(PERSON_ID,_storeHandle)){
+								BWStatus[PERSON_ID].low_sg=BWStatus[PERSON_ID].low_sg+1;
+							}
+							else{
+								BWStatus[PERSON_ID].inrange_sg=BWStatus[PERSON_ID].inrange_sg+1;
+							}
+						}
+					}
+					else if(ft==HYPOHYPER && intValues[SG_mgdL]==(int32)777){
+					
+						BWStatus[PERSON_ID].hypo_count=BWStatus[PERSON_ID].hypo_count+(int32)(flagValues[HYPOEPISODE]?1:0);
+						BWStatus[PERSON_ID].hyper_count=BWStatus[PERSON_ID].hyper_count+(int32)(flagValues[HYPEREPISODE]?1:0);
+						
+					}
+					
+				
+				}
+				
+			
+			}
+			
+		
+		
+		}
+		
+	}
+	
+	
+	//process the features
+	(stream<GenericInsightSchema> M25_Hypo4hMeal; stream<GenericInsightSchema> M26_Hyper4hMeal;
+	 stream<GenericInsightSchema> M27_InRange4hMeal; stream<GenericInsightSchema> M28_HighRange4hMeal; 
+	 stream<GenericInsightSchema> M29_LowRange4hMeal)  = Custom(countSum)  {
+	 
+		logic
+			state:{
+				mutable map<rstring, int32> result = {};
+			}
+			
+			onTuple countSum: {
+	 
+				//check the min packet required and submit the feature 
+				if(total_sg>=$sgmin && (float64)(100*valid_sg/total_sg)>=$sgvalid_pct){
+					mutable GenericInsightSchema tmp = {};
+					tmp.PERSON_ID = PERSON_ID;
+					tmp.insightType= INSIGHTTYPE.MOTIVATIONAL;
+					tmp.insightMessage = (ustring) "";
+					tmp.insightJSON = (ustring) "";
+					tmp.INSIGHT_TIME_TS = PUMP_TIME_TS;
+					
+					if((float64)(hypo_count*$bw_per_month)/(float64)total_bw<=$hypo_episode_threshold){
+						tmp.insightCode = "M25";
+						tmp.insightMessage = (ustring) ("You had " + (rstring)(hypo_count) + " low excusion(s) after meals in the last month.");
+						result["insightStats"]= hypo_count;
+						tmp.insightJSON = (ustring) getInsightJson(result);
+						submit(tmp, M25_Hypo4hMeal);
+					}
+					if((float64)(hyper_count*$bw_per_month)/(float64)total_bw<=$hyper_episode_threshold){
+						tmp.insightCode = "M26";
+						tmp.insightMessage = (ustring) ("You had " + (rstring)(hyper_count) + " high excursion(s) after meals in the last month.");
+						result["insightStats"]= hyper_count;
+						tmp.insightJSON = (ustring) getInsightJson(result);
+						submit(tmp, M26_Hyper4hMeal);
+					}
+					if((float64)(inrange_sg*100)/(float64)total_sg>=(float64)$inrangepct){
+						tmp.insightCode = "M27";
+						tmp.insightMessage = (ustring) ("You had more than " + (rstring)(inrange_sg*100/total_sg) + "% time in range after meals in the last month.");
+						result["insightStats"]= (int32) inrange_sg*100/total_sg;
+						tmp.insightJSON = (ustring) getInsightJson(result);
+						submit(tmp, M27_InRange4hMeal);
+					}
+					if((float64)(high_sg*100)/(float64)total_sg<=(float64)$highrangepct){
+						tmp.insightCode = "M28";
+						tmp.insightMessage = (ustring) ("You had less than " + (rstring)(high_sg*100/total_sg) + "% time above range after meals in the last month.");
+						result["insightStats"]= (int32) high_sg*100/total_sg;
+						tmp.insightJSON = (ustring) getInsightJson(result);
+						submit(tmp, M28_HighRange4hMeal);
+					}
+					if((float64)(low_sg*100)/(float64)total_sg<=(float64)$lowrangepct){
+						tmp.insightCode = "M29";
+						tmp.insightMessage = (ustring) ("You had less than " + (rstring)(low_sg*100/total_sg) + "%  time below range after meals in the last month.");
+						result["insightStats"]= (int32) low_sg*100/total_sg;
+						tmp.insightJSON = (ustring) getInsightJson(result);
+						submit(tmp, M29_LowRange4hMeal);
+					}
+				}
+			}
+
+	}
+	
+	config restartable: false; 
+	//logLevel: debug;
+	
+} //end of composite
+
+
+
+public composite EBWSGstream(input masterStream; output EBW) {
+
+	param
+		
+		expression<WINDOW> $period;
+
+	graph
+		
+		stream<GenericDataSchemaWithFlags,tuple<int32 triggernum>> EBW = Custom(masterStream){
+            logic
+				state:{ mutable tuple<GenericDataSchemaWithFlags,tuple<int32 triggernum>> sgtmptuple = {};
+				}
+			onTuple masterStream:{
+				appTrc(Trace.trace,"EpisodeStatNight::Got tuple::"+(rstring)masterStream);
+				int32 szToday = size(currentList);
+		        int32 currentNum = $period==WEEKLY?numWeeksSinceEpoch(currentList[szToday-1].PUMP_TIME_TS):numMonthsSinceEpoch(currentList[szToday-1].PUMP_TIME_TS);  //week number or month number for last tuple in current day
+		        mutable timestamp nextdayts = 0.0;
+		        mutable int32 nextNum = 0;
+						   
+				if (has(currentList[szToday-1].floatValues,NEXT_PUMP_TIME)){
+					mutable float64 nextpumptime = currentList[szToday-1].floatValues[NEXT_PUMP_TIME];
+					nextdayts = createTimestamp((int64)nextpumptime,0u);
+					nextNum = $period==WEEKLY?numWeeksSinceEpoch(nextdayts):numMonthsSinceEpoch(nextdayts);  //week number or month number for last tuple in current day
+					//now see if nextNum is greater than the currentNum,  otherwise aggregate will not trigger
+					// no need to send the data out
+					if (nextNum<=currentNum) {
+						//appTrc(Trace.error,"EBWSGstream::  NEXT_PUMP_TIME will not trigger aggregates, so skipping this history dump");
+						return;
+					}
+			    } 
+			    else {
+					//appTrc(Trace.error,"EBWSGstream::  NEXT_PUMP_TIME not found in floatValues map!!");
+					return;
+				}
+							
+				//filter packets to pass through BW, SG and HYPOHYPER only
+				//for historyList
+				if(size(historyList)>0){
+					for (list<GenericDataSchemaWithFlags> glist in historyList){
+			            for (GenericDataSchemaWithFlags g in glist){
+			                if ((has(g.intValues,SG_mgdL) && g.ft==SG) || (has(g.floatValues,BW_carb_input_g) && g.floatValues[BW_carb_input_g]>(float64)0) ){ 
+								mutable int32 triggernum = $period==WEEKLY?numWeeksSinceEpoch(g.PUMP_TIME_TS):numMonthsSinceEpoch(g.PUMP_TIME_TS);
+								if (triggernum==currentNum) { //allow only current week or month to aggregation
+									assignFrom(sgtmptuple,g);
+									sgtmptuple.triggernum = triggernum;
+									submit(sgtmptuple,EBW);
+								}
+							}
+						}
+					}
+				}
+				//for currentList
+				if(size(currentList)>0){
+					for (GenericDataSchemaWithFlags g in currentList){
+						if ((has(g.intValues,SG_mgdL)&& g.ft==SG) || (has(g.floatValues,BW_carb_input_g) && g.floatValues[BW_carb_input_g]>(float64)0) ){ 
+							mutable int32 triggernum = $period==WEEKLY?numWeeksSinceEpoch(g.PUMP_TIME_TS):numMonthsSinceEpoch(g.PUMP_TIME_TS);
+							if (triggernum==currentNum) { //allow only current week or month to aggregation
+								assignFrom(sgtmptuple,g);
+								sgtmptuple.triggernum = triggernum;
+								submit(sgtmptuple,EBW);
+							}
+						}
+					}
+				}
+				
+				// now send dummy tuple to trigger aggregations
+			    // sgtmptuple should have the values from the very last tuple
+			    // if (has(sgtmptuple.floatValues,NEXT_PUMP_TIME)){
+					//sgtmptuple.PUMP_TIME_TS = nextdayts;
+					
+					//assign the end of the day as timestamp which may not be a last day of the stream because not all packets are included
+					
+					if($period==MONTHLY){
+						mutable int32 mm = (int32)gmmonth(sgtmptuple.PUMP_TIME_TS);
+						mutable int32 yy = (int32)gmyear(sgtmptuple.PUMP_TIME_TS);
+						mm = mm+2; 
+						if(mm==13){
+							mm=1;
+							yy=yy+1;
+						}
+						mutable rstring ms = (rstring)mm;
+						if(length(ms)==1){
+							ms="0"+ms;
+						}
+						sgtmptuple.PUMP_TIME_TS = toTimestamp(Sys.MM_DD_YYYY_hh_mm_ss, ms+"/01/"+(rstring)yy+" 00:00:00", "UTC");
+					}
+					else if($period==WEEKLY){
+						//get day difference from the current day to next Sunday - which is the start date of the new week  
+						mutable int32 ddiff = 7 - (int32)gmdayOfWeek(sgtmptuple.PUMP_TIME_TS);
+						sgtmptuple.PUMP_TIME_TS = addDays(todayStart(sgtmptuple.PUMP_TIME_TS),ddiff);
+					}
+					
+					sgtmptuple.PUMP_TIME = getTimeStampString(sgtmptuple.PUMP_TIME_TS);
+					sgtmptuple.triggernum = nextNum;
+					sgtmptuple.ft = DUMMY;
+					clearM(sgtmptuple.floatValues);
+					clearM(sgtmptuple.intValues);
+					clearM(sgtmptuple.stringValues);
+					clearM(sgtmptuple.flagValues);
+					sgtmptuple.sequenceNumber = (int64)getNullIntValue();
+					submit(sgtmptuple,EBW);
+				//} else {
+					//appTrc(Trace.error,"EBWSGstream::  NEXT_PUMP_TIME not found in floatValues map");
+				//}
+				
+			}
+		}
+		
+}
+
+

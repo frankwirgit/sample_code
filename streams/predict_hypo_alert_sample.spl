@@ -1,0 +1,93 @@
+/* An example to issue hypo alert and request for getting user feedback
+ * by giving a specific hypo episode window based on the smoothed hypo scores
+ * predicted through base model scoring
+*/
+
+namespace com.ibm.mdt.hypoprediction.alert.test;
+
+use com.ibm.mdt.hypoprediction.alert::*;
+use com.ibm.mdt.unittest::* ;
+use com.ibm.mdt.spltypes::*;
+use com.ibm.mdt.utils::*;
+use com.ibm.streamsx.json::*;
+
+type alertMsgStr = rstring key, rstring message;
+
+public composite HypoAlertTest{
+	param
+		expression<rstring> $infile :"smooth-in.csv";
+	graph
+
+		stream<SMOOTHEDSCORETYPE> smoothedscoreStream = TestInputFileCsv() {
+			param
+				schema : SMOOTHEDSCORETYPE;
+				name : $infile;
+				hasHeader : false;
+		}
+
+
+		//  Send smoothed scored to Kafka only if doNotPublish is false
+		stream<SMOOTHEDSCORETYPE> smoothedscoreStreamToKafka = Functor(smoothedscoreStream) {
+		            param
+		                filter : doNotPublish==false;
+
+		}
+
+		// Create the hypo alert
+		// 1. hypo quantization was resulted in high risk level
+		// 2. the previous alert was created no less than 30 min
+
+		stream<AlertSchema> alertStream = Custom(smoothedscoreStreamToKafka){
+
+		logic
+			state:{
+				mutable ustring alertjson="";
+				mutable map <int32,timestamp> lastAlertTime= {};
+				mutable map <int32,int32> last_hypQuant = {};
+
+			}
+			onTuple smoothedscoreStreamToKafka: {
+				mutable timestamp ts_current = toTimestamp(Sys.YYYY_MM_DD_hh_mm_ss,regexReplace(substring(PUMP_TIME,0,19), "T", " ", true),"UTC");
+				//check the sate
+				if (has(lastAlertTime,PERSON_ID)){
+					//Only send out alert if hypo quantization level is high and the last sent is no less than 30min ago
+					if (last_hypQuant[PERSON_ID]==1 && hypQuant == 2 && diffAsSecs(ts_current,lastAlertTime[PERSON_ID])>= (float64)(1800)) {
+						lastAlertTime[PERSON_ID]=ts_current;
+
+						//send out the alert
+						submit({PERSON_ID=PERSON_ID,ALERT_TIME=PUMP_TIME,ALERT_TYPE="HYPO",ALERT_JSON=getAlertJson(ts_current)},alertStream);
+					}
+					//update the last quantization
+					last_hypQuant[PERSON_ID]=hypQuant;
+				}
+				else{
+					last_hypQuant[PERSON_ID]=hypQuant; //initial the last quantization risk level
+					if (hypQuant==2) { // we don't have any alert for this person before, but we now see the quantization level as high, so send out an alert
+					lastAlertTime[PERSON_ID]=ts_current;
+					
+					//send out the alert
+				    submit({PERSON_ID=PERSON_ID,ALERT_TIME=PUMP_TIME,ALERT_TYPE="HYPO",ALERT_JSON=getAlertJson(ts_current)},alertStream);
+					}
+				}
+
+
+			}
+
+		}
+
+		stream<alertMsgStr> messageStream = Functor(alertStream) {
+
+                output
+                    messageStream : key = (rstring)PERSON_ID, message = (rstring)ALERT_JSON;
+        }
+
+
+		() as sink= TestOutputFile(messageStream)
+		{
+			param
+				name : "alert-out.csv";
+				schema : alertMsgStr;
+		}
+
+
+}
