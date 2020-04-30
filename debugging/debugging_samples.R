@@ -7,6 +7,22 @@
 # Note: the patient IDs used displayed in this file are not real IDs
 # and the pateints have been de-identified to meet data security
 
+# sample list
+# Example 1: Analyze the impact due to the clean SG data loss to the generation of glycemic insights 
+
+# Example 2: Debug the clean SG data loss
+# Compare the DB2 extraction from raw SG and clean SG tables
+# Compare the Kafka extraction based on Kafka topics of MDTLIVE and MDTPRIME
+# Analyze the impacts brought by gaps 
+
+# Example 3: Analyze the impact to the PE re-distributions and job load balances 
+# due to the streams job restarting caused by various network and system issues
+
+# Example 4: Analyze the impact brought by the missing data (gap) and catchup packets
+# to the hypo alerts - such as false hypo alert, renewed hypo alerts and the impact to
+# the FDR (false discovery ratio)
+
+
 #clean the workspace
 rm(list = ls())
 
